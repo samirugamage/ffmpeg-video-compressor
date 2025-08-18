@@ -3,8 +3,11 @@ name: Build & Release Windows EXE
 on:
   push:
     tags:
-      - 'v*'         # e.g. v1.0.0
-  workflow_dispatch:  # allow manual runs too
+      - 'v*'        # e.g. v1.0.0
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required to upload release assets
 
 jobs:
   build-windows:
@@ -14,55 +17,102 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      - name: Show runner info
+        shell: pwsh
+        run: |
+          $PSVersionTable
+          where.exe 7z | Out-Host
+          where.exe python | Out-Host
+          where.exe pip | Out-Host
+
+      - name: Ensure 7-Zip CLI is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            Write-Host "7z not found, installing via Chocolatey..."
+            choco install 7zip -y
+          }
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            throw "7z (7-Zip CLI) not available after install."
+          }
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install build dependencies
+      - name: Install build deps
         shell: pwsh
         run: |
           pip install --upgrade pip
           pip install pyinstaller psutil
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-      # Download the Gyan full build (correct release link)
       - name: Download FFmpeg (Gyan full build)
         shell: pwsh
         run: |
           $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z"
           $out = "ffmpeg.7z"
-          Invoke-WebRequest -Uri $url -OutFile $out
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          if (-not (Test-Path $out)) { throw "Failed to download ffmpeg .7z" }
           7z x $out -y -offmpeg
-          # Find ffmpeg.exe under extracted tree (bin\ffmpeg.exe)
-          $ff = Get-ChildItem -Path "ffmpeg" -Recurse -Filter "ffmpeg.exe" | Where-Object { $_.FullName -match "\\bin\\ffmpeg\.exe$" } | Select-Object -First 1 -ExpandProperty FullName
+          # Find bin\ffmpeg.exe inside extraction
+          $ff = Get-ChildItem -Path "ffmpeg" -Recurse -Filter "ffmpeg.exe" |
+                Where-Object { $_.FullName -match "\\bin\\ffmpeg\.exe$" } |
+                Select-Object -First 1 -ExpandProperty FullName
+          if (-not $ff) {
+            # Fallback: first ffmpeg.exe anywhere
+            $ff = Get-ChildItem -Path "ffmpeg" -Recurse -Filter "ffmpeg.exe" |
+                  Select-Object -First 1 -ExpandProperty FullName
+          }
           if (-not $ff) { throw "ffmpeg.exe not found after extraction." }
           "FFMPEG_EXE=$ff" | Out-File -FilePath $Env:GITHUB_ENV -Append
           Write-Host "Using ffmpeg at $ff"
 
-      - name: Build one-file EXE with PyInstaller
+      - name: Detect entry script
+        id: detect
         shell: pwsh
         run: |
-          # CHANGE THIS if your entry script has a different filename:
-          $EntryScript = "gui_ffmpeg_compressor.py"
-
-          if (-not (Test-Path $EntryScript)) {
-            throw "Entry script '$EntryScript' not found. Update the workflow to point to your main .py file."
+          $candidates = @('gui_ffmpeg_compressor.py','main.py','compressor.py','app.py')
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = $c; break }
           }
+          if (-not $found) {
+            Write-Host "Repo files:"; Get-ChildItem -Recurse -File | Select-Object -First 200 | Out-Host
+            throw "No entry script found. Expected one of: $($candidates -join ', ')"
+          }
+          "ENTRY=$found" | Out-File -FilePath $Env:GITHUB_ENV -Append
+          Write-Host "Entry script: $found"
 
-          pyinstaller --name FFmpegCompressor --onefile --noconsole $EntryScript --add-binary "$Env:FFMPEG_EXE;."
-          Get-ChildItem -Recurse dist
+      - name: Build EXE (PyInstaller onefile GUI)
+        shell: pwsh
+        run: |
+          $Entry = "${{ env.ENTRY }}"
+          pyinstaller --name FFmpegCompressor --onefile --noconsole $Entry --add-binary "$Env:FFMPEG_EXE;."
+          Write-Host "Artifacts in dist:"
+          Get-ChildItem -Recurse dist | Out-Host
 
-      - name: Rename EXE to include tag
+      - name: Verify built EXE
+        shell: pwsh
+        run: |
+          $exe = Join-Path "dist" "FFmpegCompressor.exe"
+          if (-not (Test-Path $exe)) {
+            throw "dist/FFmpegCompressor.exe not found; PyInstaller build failed."
+          }
+          certutil -hashfile $exe SHA256 | Out-Host
+          "BUILT_EXE=$exe" | Out-File -FilePath $Env:GITHUB_ENV -Append
+
+      - name: Rename EXE to include tag (if tag build)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          $src = "dist/FFmpegCompressor.exe"
+          $src = "${{ env.BUILT_EXE }}"
           $dst = "dist/FFmpegCompressor-$tag.exe"
-          if (-not (Test-Path $src)) { throw "Built EXE not found at $src" }
           Copy-Item $src $dst -Force
-          Write-Host "Release asset prepared: $dst"
+          Write-Host "Release asset: $dst"
           "RELEASE_ASSET=$dst" | Out-File -FilePath $Env:GITHUB_ENV -Append
 
       - name: Upload EXE to GitHub Release
@@ -70,11 +120,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.RELEASE_ASSET }}
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Optional: also upload as workflow artifact (useful for non-tag/manual runs)
-      - name: Upload build artifact
+      - name: Upload artifact (always)
         uses: actions/upload-artifact@v4
         with:
           name: FFmpegCompressor-Windows
