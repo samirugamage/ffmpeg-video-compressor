@@ -40,24 +40,27 @@ PRESETS = [
 ]
 
 AUDIO_BR_CHOICES = ["64k", "96k", "128k", "160k", "192k", "256k"]
-
 def find_ffmpeg():
-    # Prefer bundled ffmpeg if present
-    candidates = []
+    # First try system PATH (winget-installed ffmpeg)
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+
+    # Fall back to bundled ffmpeg if available
     if getattr(sys, 'frozen', False):
         meipass = getattr(sys, '_MEIPASS', None)
         if meipass:
-            candidates.append(os.path.join(meipass, "ffmpeg.exe"))
-        candidates.append(os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe"))
-    else:
-        candidates.append(os.path.join(os.path.dirname(__file__), "ffmpeg.exe"))
-    candidates.append(shutil.which("ffmpeg"))
+            candidate = os.path.join(meipass, "ffmpeg.exe")
+            if os.path.exists(candidate):
+                return candidate
+        exe_dir = os.path.dirname(sys.executable)
+        candidate = os.path.join(exe_dir, "ffmpeg.exe")
+        if os.path.exists(candidate):
+            return candidate
 
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    # Fallback to PATH resolution
+    # As last resort
     return "ffmpeg"
+
 
 class App:
     def __init__(self, root):
@@ -417,16 +420,21 @@ class App:
         return f"scale={w}:{h}"
 
     def _run_ffmpeg(self, args):
-        self.log_write(" ".join([self._quote(a) for a in args]) + "\n")
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-        for line in proc.stdout:
-            if not line:
-                continue
-            if "frame=" in line or "time=" in line or "bitrate=" in line or "speed=" in line:
-                self.log_write(line)
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed with code {proc.returncode}")
+    self.log_write(" ".join([self._quote(a) for a in args]) + "\n")
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    last = []
+    for line in proc.stdout:
+        if not line:
+            continue
+        self.log_write(line)
+        last.append(line.rstrip())
+        if len(last) > 60:
+            last.pop(0)
+    proc.wait()
+    if proc.returncode != 0:
+        tail = "\n".join(last)
+        raise RuntimeError(f"ffmpeg failed with code {proc.returncode}\n\nLast lines:\n{tail}")
+
 
     def log_write(self, s):
         self.log.insert(tk.END, s)
