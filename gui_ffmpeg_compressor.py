@@ -420,20 +420,20 @@ class App:
         return f"scale={w}:{h}"
 
     def _run_ffmpeg(self, args):
-    self.log_write(" ".join([self._quote(a) for a in args]) + "\n")
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-    last = []
-    for line in proc.stdout:
-        if not line:
-            continue
-        self.log_write(line)
-        last.append(line.rstrip())
-        if len(last) > 60:
-            last.pop(0)
-    proc.wait()
-    if proc.returncode != 0:
-        tail = "\n".join(last)
-        raise RuntimeError(f"ffmpeg failed with code {proc.returncode}\n\nLast lines:\n{tail}")
+        self.log_write(" ".join([self._quote(a) for a in args]) + "\n")
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        last = []
+        for line in proc.stdout:
+            if not line:
+                continue
+            self.log_write(line)
+            last.append(line.rstrip())
+            if len(last) > 60:
+                last.pop(0)
+        proc.wait()
+        if proc.returncode != 0:
+            tail = "\n".join(last)
+            raise RuntimeError(f"ffmpeg failed with code {proc.returncode}\n\nLast lines:\n{tail}")
 
 
     def log_write(self, s):

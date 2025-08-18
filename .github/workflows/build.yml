@@ -8,8 +8,9 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -22,17 +23,20 @@ jobs:
           pip install --upgrade pip
           pip install pyinstaller
 
-      - name: Install ffmpeg via Chocolatey
-        run: choco install ffmpeg -y
+      # Install Gyan full ffmpeg via winget
+      - name: Install ffmpeg (Gyan full) via winget
+        run: |
+          winget install --id=Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements
 
-      - name: Locate ffmpeg
+      - name: Locate ffmpeg.exe
         shell: pwsh
         run: |
-          $ff = (Get-Command ffmpeg).Source
-          "FFMPEG_EXE=$ff" | Out-File -FilePath $Env:GITHUB_ENV -Append
-          Write-Host "ffmpeg at $ff"
+          $real = Get-ChildItem 'C:\Program Files\ffmpeg\bin' -Filter ffmpeg.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $real) { throw "ffmpeg.exe not found after winget install" }
+          "FFMPEG_EXE=$real" | Out-File -FilePath $Env:GITHUB_ENV -Append
+          Write-Host "Using ffmpeg at $real"
 
-      - name: Build one file exe
+      - name: Build one-file exe
         shell: pwsh
         run: |
           pyinstaller --name FFmpegCompressor --onefile --noconsole gui_ffmpeg_compressor.py --add-binary "$Env:FFMPEG_EXE;."
