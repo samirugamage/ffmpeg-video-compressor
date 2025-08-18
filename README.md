@@ -27,7 +27,7 @@ You can adjust **bitrate, quality, resolution**, and now:
 ---
 
 ## Usage
-1. Launch the app.  
+1. Launch the app.   
 2. Select one or more folders containing videos.  
 3. Choose bitrate, resolution, and quality.  
 4. Start compression.  
