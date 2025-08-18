@@ -22,6 +22,7 @@ RESOLUTION_PRESETS = [
     ("Custom width",    "custom"),
 ]
 
+# Added GPU encoders (NVENC / QSV / AMF) without removing existing options
 CODEC_CHOICES = [
     ("H.264 (CPU x264)", "libx264"),
     ("H.265 (CPU x265)", "libx265"),
@@ -33,7 +34,6 @@ CODEC_CHOICES = [
     ("H.265 (AMD AMF)", "hevc_amf"),
 ]
 
-# Shown for CPU x264/x265. For GPU encoders we map to their own knobs.
 PRESETS = [
     "ultrafast",
     "superfast",
@@ -50,19 +50,25 @@ AUDIO_BR_CHOICES = ["64k", "96k", "128k", "160k", "192k", "256k"]
 
 
 def find_ffmpeg():
-    # Prefer ffmpeg.exe shipped alongside the packaged app
+    # 1) Prefer ffmpeg.exe shipped alongside the packaged app (onedir)
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
         bundled = os.path.join(exe_dir, "ffmpeg.exe")
         if os.path.exists(bundled):
             return bundled
+        # 2) If onefile, PyInstaller extracts into _MEIPASS
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            candidate = os.path.join(meipass, "ffmpeg.exe")
+            if os.path.exists(candidate):
+                return candidate
 
-    # Fallback to system PATH (winget or manual install)
+    # 3) Fallback to system PATH
     sys_ffmpeg = shutil.which("ffmpeg")
     if sys_ffmpeg:
         return sys_ffmpeg
 
-    # Last resort
+    # 4) Last resort (let shell resolve; likely errors loudly if missing)
     return "ffmpeg"
 
 
@@ -78,7 +84,7 @@ class App:
         self.mode = tk.StringVar(value="crf")       # "crf" or "bitrate"
         self.crf = tk.IntVar(value=23)              # 14 to 35 suggested
         self.bitrate_kbps = tk.IntVar(value=2500)   # for bitrate mode
-        self.twopass = tk.BooleanVar(value=True)    # used only for CPU encoders
+        self.twopass = tk.BooleanVar(value=True)    # CPU-only; disabled for GPU encoders
 
         self.codec = tk.StringVar(value="libx264")
         self.vpreset = tk.StringVar(value="medium")
@@ -92,24 +98,18 @@ class App:
         self._build_ui()
         self._update_mode_visibility()
         self._update_suggestions()
+        self._log_ffmpeg_version()
 
-        # Probe encoders so we can warn early
-        self.available_encoders = self._probe_encoders()
-
-    def _probe_encoders(self):
+    def _log_ffmpeg_version(self):
         try:
-            out = subprocess.check_output(
-                [self.ffmpeg_path, "-hide_banner", "-encoders"],
-                universal_newlines=True,
-                stderr=subprocess.STDOUT
-            )
-        except Exception:
-            return set()
-        have = set()
-        for key in ("libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"):
-            if key in out:
-                have.add(key)
-        return have
+            out = subprocess.check_output([self.ffmpeg_path, "-version"],
+                                          universal_newlines=True,
+                                          stderr=subprocess.STDOUT)
+            first = out.splitlines()[0] if out else ""
+            if first:
+                self.log_write(first + "\n")
+        except Exception as e:
+            self.log_write(f"Could not run ffmpeg -version: {e}\n")
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
@@ -144,8 +144,10 @@ class App:
         mode_frame = ttk.Frame(vid_frame)
         mode_frame.pack(fill="x", **pad)
         ttk.Label(mode_frame, text="Mode").pack(side="left")
-        ttk.Radiobutton(mode_frame, text="Quality (CRF)", variable=self.mode, value="crf", command=self._update_mode_visibility).pack(side="left", padx=10)
-        ttk.Radiobutton(mode_frame, text="Bitrate (kbps)", variable=self.mode, value="bitrate", command=self._update_mode_visibility).pack(side="left", padx=10)
+        ttk.Radiobutton(mode_frame, text="Quality (CRF)", variable=self.mode, value="crf",
+                        command=self._update_mode_visibility).pack(side="left", padx=10)
+        ttk.Radiobutton(mode_frame, text="Bitrate (kbps)", variable=self.mode, value="bitrate",
+                        command=self._update_mode_visibility).pack(side="left", padx=10)
 
         # CRF controls
         crf_frame = ttk.Frame(vid_frame)
@@ -153,7 +155,8 @@ class App:
         self.crf_frame = crf_frame
 
         ttk.Label(crf_frame, text="CRF 14 best to 35 smallest").pack(side="left")
-        crf_scale = ttk.Scale(crf_frame, from_=14, to=35, variable=self.crf, command=lambda e: self._update_suggestions())
+        crf_scale = ttk.Scale(crf_frame, from_=14, to=35, variable=self.crf,
+                              command=lambda e: self._update_suggestions())
         crf_scale.pack(side="left", fill="x", expand=True, padx=10)
         self.crf_val_label = ttk.Label(crf_frame, text="23")
         self.crf_val_label.pack(side="left", padx=6)
@@ -169,29 +172,35 @@ class App:
         self.br_frame = br_frame
 
         ttk.Label(br_frame, text="Target video bitrate").pack(side="left")
-        br_scale = ttk.Scale(br_frame, from_=200, to=20000, variable=self.bitrate_kbps, command=lambda e: self._update_suggestions())
+        br_scale = ttk.Scale(br_frame, from_=200, to=20000, variable=self.bitrate_kbps,
+                             command=lambda e: self._update_suggestions())
         br_scale.pack(side="left", fill="x", expand=True, padx=10)
         self.br_val_label = ttk.Label(br_frame, text="2500 kbps")
         self.br_val_label.pack(side="left", padx=6)
         self.bitrate_kbps.trace_add("write", lambda *_: self._update_suggestions())
 
-        self.twopass_chk = ttk.Checkbutton(vid_frame, text="Two pass for tighter size (CPU only)", variable=self.twopass)
+        self.twopass_chk = ttk.Checkbutton(vid_frame, text="Two pass for tighter size (CPU only)",
+                                           variable=self.twopass)
         self.twopass_chk.pack(anchor="w", padx=12)
 
         # Codec and preset
         row = ttk.Frame(vid_frame)
         row.pack(fill="x", **pad)
         ttk.Label(row, text="Codec").pack(side="left")
-        ttk.Combobox(row, textvariable=self.codec, values=[c for _, c in CODEC_CHOICES], width=22, state="readonly").pack(side="left", padx=8)
+        ttk.Combobox(row, textvariable=self.codec, values=[c for _, c in CODEC_CHOICES],
+                     width=26, state="readonly").pack(side="left", padx=8)
 
         ttk.Label(row, text="Encoder preset").pack(side="left", padx=16)
-        ttk.Combobox(row, textvariable=self.vpreset, values=PRESETS, width=10, state="readonly").pack(side="left", padx=8)
+        ttk.Combobox(row, textvariable=self.vpreset, values=PRESETS, width=10,
+                     state="readonly").pack(side="left", padx=8)
 
         # Resolution
         res_frame = ttk.Frame(vid_frame)
         res_frame.pack(fill="x", **pad)
         ttk.Label(res_frame, text="Resolution").pack(side="left")
-        ttk.Combobox(res_frame, textvariable=self.res_choice, values=[label for label, _ in RESOLUTION_PRESETS], width=22, state="readonly").pack(side="left", padx=8)
+        ttk.Combobox(res_frame, textvariable=self.res_choice,
+                     values=[label for label, _ in RESOLUTION_PRESETS],
+                     width=22, state="readonly").pack(side="left", padx=8)
         ttk.Label(res_frame, text="Custom width").pack(side="left", padx=16)
         self.cw_entry = ttk.Entry(res_frame, textvariable=self.custom_width, width=8)
         self.cw_entry.pack(side="left")
@@ -201,7 +210,8 @@ class App:
         aud_frame = ttk.LabelFrame(self.root, text="Audio")
         aud_frame.pack(fill="x", **pad)
         ttk.Label(aud_frame, text="Bitrate").pack(side="left")
-        ttk.Combobox(aud_frame, textvariable=self.abitrate, values=AUDIO_BR_CHOICES, width=8, state="readonly").pack(side="left", padx=8)
+        ttk.Combobox(aud_frame, textvariable=self.abitrate, values=AUDIO_BR_CHOICES,
+                     width=8, state="readonly").pack(side="left", padx=8)
 
         # Suggestions
         sug_frame = ttk.LabelFrame(self.root, text="Suggestions")
@@ -223,7 +233,7 @@ class App:
         self.log = tk.Text(log_frame, height=12)
         self.log.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # Show current ffmpeg
+        # Show current ffmpeg path
         self.log_write(f"Using ffmpeg at: {self.ffmpeg_path}\n")
 
         # React to resolution changes
@@ -233,7 +243,8 @@ class App:
         self.custom_width.trace_add("write", on_res_change)
 
     def add_files(self):
-        files = filedialog.askopenfilenames(title="Choose MP4 files", filetypes=[("MP4", "*.mp4"), ("All files", "*.*")])
+        files = filedialog.askopenfilenames(title="Choose MP4 files",
+                                            filetypes=[("MP4", "*.mp4"), ("All files", "*.*")])
         if not files:
             return
         for f in files:
@@ -254,19 +265,24 @@ class App:
         if d:
             self.output_dir.set(d)
 
+    def _is_gpu_encoder(self, enc):
+        return enc in ("h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf")
+
     def _update_mode_visibility(self):
         if self.mode.get() == "crf":
             self.crf_frame.pack_configure()
             self.br_frame.forget()
-            self.twopass_chk.state(["disabled"] if self._is_gpu_encoder(self.codec.get()) else ["!disabled"])
         else:
             self.br_frame.pack_configure()
             self.crf_frame.forget()
-            self.twopass_chk.state(["disabled"] if self._is_gpu_encoder(self.codec.get()) else ["!disabled"])
-        self._update_suggestions()
 
-    def _is_gpu_encoder(self, enc):
-        return enc in ("h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf")
+        # Two-pass is CPU-only; disable when GPU encoder is selected
+        if self._is_gpu_encoder(self.codec.get()):
+            self.twopass_chk.state(["disabled"])
+        else:
+            self.twopass_chk.state(["!disabled"])
+
+        self._update_suggestions()
 
     def _estimate_reco_bitrate(self):
         label = self.res_choice.get()
@@ -280,6 +296,7 @@ class App:
                 else:
                     width = v[0]
                 break
+
         if width is None:
             return "Depends on source resolution"
         if width >= 3840:
@@ -325,6 +342,9 @@ class App:
             txt = f"Target bitrate {kbps} kbps. {feel}.\nTypical range for chosen resolution: {bands}."
             if self.twopass.get() and not self._is_gpu_encoder(self.codec.get()):
                 txt += "\nTwo pass gives tighter sizes for bitrate mode."
+
+        if self._is_gpu_encoder(self.codec.get()):
+            txt += "\nNote: Two-pass is CPU-only; hardware encoders use single-pass VBR/CQ."
         self.suggestion_lbl.config(text=txt)
 
     def start(self):
@@ -337,12 +357,6 @@ class App:
             self.output_dir.set(outdir)
         if not os.path.isdir(outdir):
             messagebox.showerror("Bad folder", "Output folder does not exist.")
-            return
-
-        # Encoder availability check
-        sel_enc = self.codec.get()
-        if sel_enc not in self.available_encoders:
-            messagebox.showerror("Encoder not available", f"The selected encoder '{sel_enc}' is not available in this ffmpeg build.\nChoose a different codec.")
             return
 
         self.start_btn.config(state="disabled")
@@ -362,29 +376,28 @@ class App:
             self.start_btn.config(state="normal")
 
     def _map_preset_args(self, vcodec, preset):
-        # Map UI preset to encoder specific flags
+        # Keep your presets, map to GPU where needed
         if vcodec in ("libx264", "libx265"):
             return ["-preset", preset]
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
-            # Map x264 style names to NVENC p levels
+            # Map x264-style names to NVENC p-levels
             map_nv = {
                 "ultrafast": "p1",
                 "superfast": "p2",
-                "veryfast": "p3",
-                "faster":    "p3",
-                "fast":      "p4",
-                "medium":    "p4",
-                "slow":      "p5",
-                "slower":    "p6",
-                "veryslow":  "p7",
+                "veryfast":  "p3",
+                "faster":     "p3",
+                "fast":       "p4",
+                "medium":     "p4",
+                "slow":       "p5",
+                "slower":     "p6",
+                "veryslow":   "p7",
             }
-            nv = map_nv.get(preset, "p4")
-            return ["-preset", nv, "-tune", "hq"]
+            return ["-preset", map_nv.get(preset, "p4"), "-tune", "hq"]
         if vcodec in ("h264_qsv", "hevc_qsv"):
-            # QSV accepts -preset names like veryslow..veryfast on many builds
+            # Most QSV builds accept -preset names similar to x264
             return ["-preset", preset]
         if vcodec in ("h264_amf", "hevc_amf"):
-            # AMF uses -quality rather than -preset in practice
+            # AMF prefers -quality over -preset
             return ["-quality", "quality"]
         return []
 
@@ -403,7 +416,7 @@ class App:
             # CPU scale by default which is safe across all encoders
             vf_args = ["-vf", scale_filter]
 
-        # hwaccel on decode side when using GPU encoders
+        # GPU-friendly decode flags when a GPU encoder is chosen
         hw_flags = []
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
             hw_flags = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
@@ -421,18 +434,19 @@ class App:
         ] + self._map_preset_args(vcodec, preset) + vf_args
 
         if self.mode.get() == "crf":
-            # Unified quality knob mapping
+            # Map your CRF slider to each encoder's quality knob
             c = int(self.crf.get())
             v_args = []
             if vcodec in ("h264_nvenc", "hevc_nvenc"):
                 cq = max(14, min(35, c))
-                v_args = ["-rc", "vbr", "-cq", str(cq)]
+                v_args = ["-rc", "vbr", "-cq", str(cq), "-tune", "hq"]
             elif vcodec in ("h264_qsv", "hevc_qsv"):
                 gq = max(16, min(35, c))
                 v_args = ["-global_quality", str(gq)]
             elif vcodec in ("h264_amf", "hevc_amf"):
                 qp = max(18, min(35, c))
-                v_args = ["-rc", "vbr_latency", "-qp_i", str(qp - 1), "-qp_p", str(qp), "-qp_b", str(qp + 2)]
+                v_args = ["-rc", "vbr_latency", "-quality", "quality",
+                          "-qp_i", str(qp - 1), "-qp_p", str(qp), "-qp_b", str(qp + 2)]
             else:
                 v_args = ["-crf", str(c)]
 
@@ -472,14 +486,14 @@ class App:
                     ]
                     self._run_ffmpeg(args2)
             else:
-                # Single pass for GPU encoders and also for CPU if two pass off
+                # Single pass for GPU encoders and for CPU if two-pass off
                 v_args = []
                 if vcodec in ("h264_nvenc", "hevc_nvenc"):
-                    v_args = ["-rc", "vbr", "-b:v", kbps]
+                    v_args = ["-rc", "vbr", "-b:v", kbps, "-tune", "hq"]
                 elif vcodec in ("h264_qsv", "hevc_qsv"):
                     v_args = ["-b:v", kbps]
                 elif vcodec in ("h264_amf", "hevc_amf"):
-                    v_args = ["-rc", "vbr_latency", "-b:v", kbps]
+                    v_args = ["-rc", "vbr_latency", "-b:v", kbps, "-quality", "quality"]
                 else:
                     v_args = ["-b:v", kbps]
 
@@ -504,6 +518,7 @@ class App:
             return None
         if choice == "custom":
             w = max(16, int(self.custom_width.get()))
+            # Use -2 to keep aspect and align to even heights
             return f"scale={w}:-2"
         w, h = choice
         return f"scale={w}:{h}"
@@ -515,7 +530,6 @@ class App:
         for line in proc.stdout:
             if not line:
                 continue
-            # Log everything so errors are visible
             self.log_write(line)
             last.append(line.rstrip())
             if len(last) > 80:
