@@ -1,0 +1,2 @@
+# Tkinter is in the standard library
+# No third party runtime deps required
