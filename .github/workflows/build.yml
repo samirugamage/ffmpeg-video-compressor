@@ -23,16 +23,17 @@ jobs:
           pip install --upgrade pip
           pip install pyinstaller
 
-      # Install Gyan full ffmpeg via winget
-      - name: Install ffmpeg (Gyan full) via winget
-        run: |
-          winget install --id=Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements
-
-      - name: Locate ffmpeg.exe
+      # Download Gyan full build
+      - name: Download ffmpeg (Gyan full static build)
         shell: pwsh
         run: |
-          $real = Get-ChildItem 'C:\Program Files\ffmpeg\bin' -Filter ffmpeg.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $real) { throw "ffmpeg.exe not found after winget install" }
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z"
+          $out = "ffmpeg.7z"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          # Extract with 7zip (preinstalled on GitHub runner)
+          7z x $out -y -offmpeg
+          $real = Get-ChildItem "ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $real) { throw "ffmpeg.exe not found after download" }
           "FFMPEG_EXE=$real" | Out-File -FilePath $Env:GITHUB_ENV -Append
           Write-Host "Using ffmpeg at $real"
 
