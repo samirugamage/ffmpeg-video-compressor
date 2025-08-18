@@ -4,8 +4,15 @@ import shutil
 import threading
 import subprocess
 import tempfile
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+# NEW: process control for pause/resume
+try:
+    import psutil  # pip install psutil
+except Exception:
+    psutil = None  # we'll warn in the UI if it's missing
 
 APP_TITLE = "FFmpeg MP4 Compressor"
 
@@ -22,7 +29,7 @@ RESOLUTION_PRESETS = [
     ("Custom width",    "custom"),
 ]
 
-# Added GPU encoders (NVENC / QSV / AMF) without removing existing options
+# CPU and GPU encoders
 CODEC_CHOICES = [
     ("H.264 (CPU x264)", "libx264"),
     ("H.265 (CPU x265)", "libx265"),
@@ -48,27 +55,28 @@ PRESETS = [
 
 AUDIO_BR_CHOICES = ["64k", "96k", "128k", "160k", "192k", "256k"]
 
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v", ".avi", ".webm", ".mts", ".m2ts"}
+
 
 def find_ffmpeg():
-    # 1) Prefer ffmpeg.exe shipped alongside the packaged app (onedir)
+    # Prefer ffmpeg.exe next to the packaged EXE (onedir)
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
         bundled = os.path.join(exe_dir, "ffmpeg.exe")
         if os.path.exists(bundled):
             return bundled
-        # 2) If onefile, PyInstaller extracts into _MEIPASS
+        # PyInstaller onefile temp
         meipass = getattr(sys, '_MEIPASS', None)
         if meipass:
             candidate = os.path.join(meipass, "ffmpeg.exe")
             if os.path.exists(candidate):
                 return candidate
 
-    # 3) Fallback to system PATH
-    sys_ffmpeg = shutil.which("ffmpeg")
-    if sys_ffmpeg:
-        return sys_ffmpeg
+    # Fallback to PATH
+    on_path = shutil.which("ffmpeg")
+    if on_path:
+        return on_path
 
-    # 4) Last resort (let shell resolve; likely errors loudly if missing)
     return "ffmpeg"
 
 
@@ -76,15 +84,22 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("880x600")
+        root.geometry("900x650")
 
         self.ffmpeg_path = find_ffmpeg()
-        self.input_files = []
+        self.input_files = []  # absolute paths
+
+        # job control
+        self.worker_thread = None
+        self.pause_flag = threading.Event()
+        self.pause_flag.set()  # running by default
+        self.current_proc = None  # subprocess.Popen for ffmpeg
+        self.is_running = False
 
         self.mode = tk.StringVar(value="crf")       # "crf" or "bitrate"
-        self.crf = tk.IntVar(value=23)              # 14 to 35 suggested
+        self.crf = tk.IntVar(value=23)              # 14..35
         self.bitrate_kbps = tk.IntVar(value=2500)   # for bitrate mode
-        self.twopass = tk.BooleanVar(value=True)    # CPU-only; disabled for GPU encoders
+        self.twopass = tk.BooleanVar(value=True)    # CPU only
 
         self.codec = tk.StringVar(value="libx264")
         self.vpreset = tk.StringVar(value="medium")
@@ -93,54 +108,41 @@ class App:
         self.res_choice = tk.StringVar(value=RESOLUTION_PRESETS[0][0])  # label
         self.custom_width = tk.IntVar(value=1280)
 
-        self.output_dir = tk.StringVar(value="")
-
         self._build_ui()
         self._update_mode_visibility()
         self._update_suggestions()
         self._log_ffmpeg_version()
 
-    def _log_ffmpeg_version(self):
-        try:
-            out = subprocess.check_output([self.ffmpeg_path, "-version"],
-                                          universal_newlines=True,
-                                          stderr=subprocess.STDOUT)
-            first = out.splitlines()[0] if out else ""
-            if first:
-                self.log_write(first + "\n")
-        except Exception as e:
-            self.log_write(f"Could not run ffmpeg -version: {e}\n")
+        if psutil is None:
+            self.log_write("Warning: psutil not installed. Pause/Resume mid-file will be disabled.\n")
 
+    # ---------- UI ----------
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
-        # Row 0: file chooser
-        file_frame = ttk.LabelFrame(self.root, text="Input videos")
+        # Input
+        file_frame = ttk.LabelFrame(self.root, text="Input")
         file_frame.pack(fill="x", **pad)
 
-        btn_add = ttk.Button(file_frame, text="Add MP4 files", command=self.add_files)
-        btn_add.pack(side="left", padx=6, pady=6)
+        ttk.Button(file_frame, text="Add Files", command=self.add_files).pack(side="left", padx=6, pady=6)
+        ttk.Button(file_frame, text="Add Folders", command=self.add_folders).pack(side="left", padx=6, pady=6)
+        ttk.Button(file_frame, text="Remove selected", command=self.remove_selected).pack(side="left", padx=6, pady=6)
 
-        btn_remove = ttk.Button(file_frame, text="Remove selected", command=self.remove_selected)
-        btn_remove.pack(side="left", padx=6, pady=6)
-
-        self.listbox = tk.Listbox(file_frame, height=5, selectmode=tk.EXTENDED)
+        self.listbox = tk.Listbox(file_frame, height=7, selectmode=tk.EXTENDED)
         self.listbox.pack(side="left", fill="x", expand=True, padx=6, pady=6)
 
-        # Row 1: output folder
-        out_frame = ttk.LabelFrame(self.root, text="Output")
+        # Output note
+        out_frame = ttk.LabelFrame(self.root, text="Output location")
         out_frame.pack(fill="x", **pad)
+        ttk.Label(
+            out_frame,
+            text="Each source folder will get a subfolder named 'compressed videos' and outputs go there."
+        ).pack(side="left", padx=6)
 
-        ttk.Label(out_frame, text="Folder").pack(side="left", padx=6)
-        self.out_entry = ttk.Entry(out_frame, textvariable=self.output_dir, width=60)
-        self.out_entry.pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(out_frame, text="Browse", command=self.choose_output_dir).pack(side="left", padx=6)
-
-        # Row 2: video options
+        # Video settings
         vid_frame = ttk.LabelFrame(self.root, text="Video settings")
         vid_frame.pack(fill="x", **pad)
 
-        # Mode
         mode_frame = ttk.Frame(vid_frame)
         mode_frame.pack(fill="x", **pad)
         ttk.Label(mode_frame, text="Mode").pack(side="left")
@@ -149,33 +151,26 @@ class App:
         ttk.Radiobutton(mode_frame, text="Bitrate (kbps)", variable=self.mode, value="bitrate",
                         command=self._update_mode_visibility).pack(side="left", padx=10)
 
-        # CRF controls
-        crf_frame = ttk.Frame(vid_frame)
-        crf_frame.pack(fill="x", **pad)
-        self.crf_frame = crf_frame
-
-        ttk.Label(crf_frame, text="CRF 14 best to 35 smallest").pack(side="left")
-        crf_scale = ttk.Scale(crf_frame, from_=14, to=35, variable=self.crf,
+        # CRF
+        self.crf_frame = ttk.Frame(vid_frame)
+        self.crf_frame.pack(fill="x", **pad)
+        ttk.Label(self.crf_frame, text="CRF 14 best  →  35 smallest").pack(side="left")
+        crf_scale = ttk.Scale(self.crf_frame, from_=14, to=35, variable=self.crf,
                               command=lambda e: self._update_suggestions())
         crf_scale.pack(side="left", fill="x", expand=True, padx=10)
-        self.crf_val_label = ttk.Label(crf_frame, text="23")
+        self.crf_val_label = ttk.Label(self.crf_frame, text="23")
         self.crf_val_label.pack(side="left", padx=6)
+        self.crf.trace_add("write", lambda *_: (self.crf_val_label.config(text=str(self.crf.get())),
+                                                self._update_suggestions()))
 
-        def on_crf_change(*_):
-            self.crf_val_label.config(text=str(self.crf.get()))
-            self._update_suggestions()
-        self.crf.trace_add("write", on_crf_change)
-
-        # Bitrate controls
-        br_frame = ttk.Frame(vid_frame)
-        br_frame.pack(fill="x", **pad)
-        self.br_frame = br_frame
-
-        ttk.Label(br_frame, text="Target video bitrate").pack(side="left")
-        br_scale = ttk.Scale(br_frame, from_=200, to=20000, variable=self.bitrate_kbps,
+        # Bitrate
+        self.br_frame = ttk.Frame(vid_frame)
+        self.br_frame.pack(fill="x", **pad)
+        ttk.Label(self.br_frame, text="Target video bitrate").pack(side="left")
+        br_scale = ttk.Scale(self.br_frame, from_=200, to=20000, variable=self.bitrate_kbps,
                              command=lambda e: self._update_suggestions())
         br_scale.pack(side="left", fill="x", expand=True, padx=10)
-        self.br_val_label = ttk.Label(br_frame, text="2500 kbps")
+        self.br_val_label = ttk.Label(self.br_frame, text="2500 kbps")
         self.br_val_label.pack(side="left", padx=6)
         self.bitrate_kbps.trace_add("write", lambda *_: self._update_suggestions())
 
@@ -183,12 +178,15 @@ class App:
                                            variable=self.twopass)
         self.twopass_chk.pack(anchor="w", padx=12)
 
-        # Codec and preset
+        # Codec + preset
         row = ttk.Frame(vid_frame)
         row.pack(fill="x", **pad)
         ttk.Label(row, text="Codec").pack(side="left")
-        ttk.Combobox(row, textvariable=self.codec, values=[c for _, c in CODEC_CHOICES],
-                     width=26, state="readonly").pack(side="left", padx=8)
+        codec_combo = ttk.Combobox(row, textvariable=self.codec,
+                                   values=[c for _, c in CODEC_CHOICES],
+                                   width=28, state="readonly")
+        codec_combo.pack(side="left", padx=8)
+        codec_combo.bind("<<ComboboxSelected>>", lambda e: self._update_mode_visibility())
 
         ttk.Label(row, text="Encoder preset").pack(side="left", padx=16)
         ttk.Combobox(row, textvariable=self.vpreset, values=PRESETS, width=10,
@@ -219,51 +217,92 @@ class App:
         self.suggestion_lbl = ttk.Label(sug_frame, text="", justify="left")
         self.suggestion_lbl.pack(fill="x", padx=6, pady=4)
 
-        # Run
+        # Controls
         run_frame = ttk.Frame(self.root)
         run_frame.pack(fill="x", **pad)
         self.start_btn = ttk.Button(run_frame, text="Start", command=self.start)
         self.start_btn.pack(side="left")
+        self.pause_btn = ttk.Button(run_frame, text="Pause", command=self.pause, state="disabled")
+        self.pause_btn.pack(side="left", padx=6)
+        self.resume_btn = ttk.Button(run_frame, text="Resume", command=self.resume, state="disabled")
+        self.resume_btn.pack(side="left")
         self.stop_btn = ttk.Button(run_frame, text="Quit", command=self.root.destroy)
         self.stop_btn.pack(side="left", padx=8)
 
         # Log
         log_frame = ttk.LabelFrame(self.root, text="Log")
         log_frame.pack(fill="both", expand=True, **pad)
-        self.log = tk.Text(log_frame, height=12)
+        self.log = tk.Text(log_frame, height=15)
         self.log.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # Show current ffmpeg path
+        # Show ffmpeg path
         self.log_write(f"Using ffmpeg at: {self.ffmpeg_path}\n")
 
-        # React to resolution changes
-        def on_res_change(*_):
-            self._update_suggestions()
-        self.res_choice.trace_add("write", on_res_change)
-        self.custom_width.trace_add("write", on_res_change)
+        # react to resolution changes
+        self.res_choice.trace_add("write", lambda *_: self._update_suggestions())
+        self.custom_width.trace_add("write", lambda *_: self._update_suggestions())
 
+    # ---------- Input ops ----------
     def add_files(self):
-        files = filedialog.askopenfilenames(title="Choose MP4 files",
-                                            filetypes=[("MP4", "*.mp4"), ("All files", "*.*")])
+        files = filedialog.askopenfilenames(
+            title="Choose video files",
+            filetypes=[("Video", "*.mp4 *.mov *.mkv *.m4v *.avi *.webm *.mts *.m2ts"),
+                       ("All files", "*.*")]
+        )
         if not files:
             return
+        self._append_files(files)
+
+    def add_folders(self):
+        # Tk doesn't support multi-select directories, so loop until user cancels
+        while True:
+            folder = filedialog.askdirectory(title="Choose a folder (Cancel to finish)")
+            if not folder:
+                break
+            self._scan_and_add(folder)
+
+    def _scan_and_add(self, folder):
+        count = 0
+        for root, _, files in os.walk(folder):
+            for name in files:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in VIDEO_EXTS:
+                    path = os.path.abspath(os.path.join(root, name))
+                    if path not in self.input_files:
+                        self.input_files.append(path)
+                        self.listbox.insert(tk.END, path)
+                        count += 1
+        self.log_write(f"Scanned '{folder}', added {count} video(s).\n")
+
+    def _append_files(self, files):
+        added = 0
         for f in files:
-            if f not in self.input_files:
-                self.input_files.append(f)
-                self.listbox.insert(tk.END, f)
+            path = os.path.abspath(f)
+            if path not in self.input_files:
+                self.input_files.append(path)
+                self.listbox.insert(tk.END, path)
+                added += 1
+        if added:
+            self.log_write(f"Added {added} file(s).\n")
 
     def remove_selected(self):
         sel = list(self.listbox.curselection())
         sel.reverse()
         for i in sel:
             path = self.listbox.get(i)
-            self.input_files.remove(path)
+            if path in self.input_files:
+                self.input_files.remove(path)
             self.listbox.delete(i)
 
-    def choose_output_dir(self):
-        d = filedialog.askdirectory(title="Choose output folder")
-        if d:
-            self.output_dir.set(d)
+    # ---------- Behavior ----------
+    def _log_ffmpeg_version(self):
+        try:
+            out = subprocess.check_output([self.ffmpeg_path, "-version"],
+                                          universal_newlines=True, stderr=subprocess.STDOUT)
+            if out:
+                self.log_write(out.splitlines()[0] + "\n")
+        except Exception as e:
+            self.log_write(f"Could not run ffmpeg -version: {e}\n")
 
     def _is_gpu_encoder(self, enc):
         return enc in ("h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf")
@@ -276,7 +315,6 @@ class App:
             self.br_frame.pack_configure()
             self.crf_frame.forget()
 
-        # Two-pass is CPU-only; disable when GPU encoder is selected
         if self._is_gpu_encoder(self.codec.get()):
             self.twopass_chk.state(["disabled"])
         else:
@@ -342,30 +380,62 @@ class App:
             txt = f"Target bitrate {kbps} kbps. {feel}.\nTypical range for chosen resolution: {bands}."
             if self.twopass.get() and not self._is_gpu_encoder(self.codec.get()):
                 txt += "\nTwo pass gives tighter sizes for bitrate mode."
-
         if self._is_gpu_encoder(self.codec.get()):
             txt += "\nNote: Two-pass is CPU-only; hardware encoders use single-pass VBR/CQ."
         self.suggestion_lbl.config(text=txt)
 
+    # ---------- Run / Pause / Resume ----------
     def start(self):
         if not self.input_files:
-            messagebox.showerror("No files", "Please add at least one video.")
-            return
-        outdir = self.output_dir.get().strip()
-        if not outdir:
-            outdir = os.path.dirname(self.input_files[0]) or os.getcwd()
-            self.output_dir.set(outdir)
-        if not os.path.isdir(outdir):
-            messagebox.showerror("Bad folder", "Output folder does not exist.")
+            messagebox.showerror("No files", "Please add at least one video or folder.")
             return
 
         self.start_btn.config(state="disabled")
-        t = threading.Thread(target=self._run_all, daemon=True)
-        t.start()
+        self.pause_btn.config(state="normal")
+        self.resume_btn.config(state="disabled")
+        self.is_running = True
+        self.pause_flag.set()
+
+        self.worker_thread = threading.Thread(target=self._run_all, daemon=True)
+        self.worker_thread.start()
+
+    def pause(self):
+        if not self.is_running:
+            return
+        self.pause_flag.clear()  # pause between files
+        self.pause_btn.config(state="disabled")
+        self.resume_btn.config(state="normal")
+        # try mid-file pause via psutil
+        if psutil and self.current_proc and self.current_proc.poll() is None:
+            try:
+                psutil.Process(self.current_proc.pid).suspend()
+                self.log_write("Paused (process suspended).\n")
+            except Exception as e:
+                self.log_write(f"Pause warning: {e}\n")
+        else:
+            self.log_write("Pause requested. Will pause before next file.\n")
+
+    def resume(self):
+        if not self.is_running:
+            return
+        # resume process first
+        if psutil and self.current_proc and self.current_proc.poll() is None:
+            try:
+                psutil.Process(self.current_proc.pid).resume()
+                self.log_write("Resumed (process resumed).\n")
+            except Exception as e:
+                self.log_write(f"Resume warning: {e}\n")
+        self.pause_flag.set()
+        self.pause_btn.config(state="normal")
+        self.resume_btn.config(state="disabled")
 
     def _run_all(self):
         try:
-            for src in self.input_files:
+            for src in list(self.input_files):
+                # allow pause between files
+                while not self.pause_flag.is_set():
+                    time.sleep(0.2)
+
                 self._convert_one(src)
             self.log_write("All done.\n")
             messagebox.showinfo("Done", "All conversions finished.")
@@ -373,14 +443,17 @@ class App:
             self.log_write(f"Error: {e}\n")
             messagebox.showerror("Error", str(e))
         finally:
+            self.is_running = False
             self.start_btn.config(state="normal")
+            self.pause_btn.config(state="disabled")
+            self.resume_btn.config(state="disabled")
+            self.current_proc = None
 
+    # ---------- Encoding ----------
     def _map_preset_args(self, vcodec, preset):
-        # Keep your presets, map to GPU where needed
         if vcodec in ("libx264", "libx265"):
             return ["-preset", preset]
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
-            # Map x264-style names to NVENC p-levels
             map_nv = {
                 "ultrafast": "p1",
                 "superfast": "p2",
@@ -394,17 +467,20 @@ class App:
             }
             return ["-preset", map_nv.get(preset, "p4"), "-tune", "hq"]
         if vcodec in ("h264_qsv", "hevc_qsv"):
-            # Most QSV builds accept -preset names similar to x264
             return ["-preset", preset]
         if vcodec in ("h264_amf", "hevc_amf"):
-            # AMF prefers -quality over -preset
             return ["-quality", "quality"]
         return []
 
     def _convert_one(self, src_path):
         base = os.path.splitext(os.path.basename(src_path))[0]
-        outdir = self.output_dir.get().strip() or os.path.dirname(src_path)
-        dst_path = os.path.join(outdir, f"{base}_small.mp4")
+
+        # NEW: per-source folder output subdir
+        src_dir = os.path.dirname(src_path)
+        outdir = os.path.join(src_dir, "compressed videos")
+        os.makedirs(outdir, exist_ok=True)
+
+        dst_path = os.path.join(outdir, f"{base}.mp4")  # same name, separate folder
 
         vcodec = self.codec.get()
         preset = self.vpreset.get()
@@ -413,10 +489,9 @@ class App:
         scale_filter = self._build_scale_filter()
         vf_args = []
         if scale_filter:
-            # CPU scale by default which is safe across all encoders
             vf_args = ["-vf", scale_filter]
 
-        # GPU-friendly decode flags when a GPU encoder is chosen
+        # Decode HW accel when using GPU encoders
         hw_flags = []
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
             hw_flags = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
@@ -434,7 +509,6 @@ class App:
         ] + self._map_preset_args(vcodec, preset) + vf_args
 
         if self.mode.get() == "crf":
-            # Map your CRF slider to each encoder's quality knob
             c = int(self.crf.get())
             v_args = []
             if vcodec in ("h264_nvenc", "hevc_nvenc"):
@@ -459,12 +533,10 @@ class App:
             self._run_ffmpeg(args)
 
         else:
-            # Bitrate mode
             kbps = str(self.bitrate_kbps.get()) + "k"
             if self.twopass.get() and vcodec in ("libx264", "libx265"):
                 with tempfile.TemporaryDirectory() as td:
                     logf = os.path.join(td, "ffpass.log")
-                    # pass 1
                     args1 = common + [
                         "-b:v", kbps,
                         "-pass", "1",
@@ -474,7 +546,6 @@ class App:
                         "NUL"
                     ]
                     self._run_ffmpeg(args1)
-                    # pass 2
                     args2 = common + [
                         "-b:v", kbps,
                         "-pass", "2",
@@ -486,7 +557,6 @@ class App:
                     ]
                     self._run_ffmpeg(args2)
             else:
-                # Single pass for GPU encoders and for CPU if two-pass off
                 v_args = []
                 if vcodec in ("h264_nvenc", "hevc_nvenc"):
                     v_args = ["-rc", "vbr", "-b:v", kbps, "-tune", "hq"]
@@ -518,27 +588,33 @@ class App:
             return None
         if choice == "custom":
             w = max(16, int(self.custom_width.get()))
-            # Use -2 to keep aspect and align to even heights
             return f"scale={w}:-2"
         w, h = choice
         return f"scale={w}:{h}"
 
+    # ---------- Subprocess driver with pause-aware UI ----------
     def _run_ffmpeg(self, args):
         self.log_write(" ".join([self._quote(a) for a in args]) + "\n")
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        self.current_proc = proc
         last = []
-        for line in proc.stdout:
-            if not line:
-                continue
-            self.log_write(line)
-            last.append(line.rstrip())
-            if len(last) > 80:
-                last.pop(0)
-        proc.wait()
+        try:
+            for line in proc.stdout:
+                if not line:
+                    continue
+                self.log_write(line)
+                last.append(line.rstrip())
+                if len(last) > 80:
+                    last.pop(0)
+        finally:
+            proc.wait()
+            self.current_proc = None
+
         if proc.returncode != 0:
             tail = "\n".join(last)
             raise RuntimeError(f"ffmpeg failed with code {proc.returncode}\n\nLast lines:\n{tail}")
 
+    # ---------- Utils ----------
     def log_write(self, s):
         self.log.insert(tk.END, s)
         self.log.see(tk.END)
