@@ -40,24 +40,27 @@ PRESETS = [
 ]
 
 AUDIO_BR_CHOICES = ["64k", "96k", "128k", "160k", "192k", "256k"]
-
 def find_ffmpeg():
-    # Prefer bundled ffmpeg if present
-    candidates = []
+    # First try system PATH (winget-installed ffmpeg)
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+
+    # Fall back to bundled ffmpeg if available
     if getattr(sys, 'frozen', False):
         meipass = getattr(sys, '_MEIPASS', None)
         if meipass:
-            candidates.append(os.path.join(meipass, "ffmpeg.exe"))
-        candidates.append(os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe"))
-    else:
-        candidates.append(os.path.join(os.path.dirname(__file__), "ffmpeg.exe"))
-    candidates.append(shutil.which("ffmpeg"))
+            candidate = os.path.join(meipass, "ffmpeg.exe")
+            if os.path.exists(candidate):
+                return candidate
+        exe_dir = os.path.dirname(sys.executable)
+        candidate = os.path.join(exe_dir, "ffmpeg.exe")
+        if os.path.exists(candidate):
+            return candidate
 
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    # Fallback to PATH resolution
+    # As last resort
     return "ffmpeg"
+
 
 class App:
     def __init__(self, root):
