@@ -426,9 +426,7 @@ class App:
     for line in proc.stdout:
         if not line:
             continue
-        # log everything so errors show up
         self.log_write(line)
-        # keep a rolling tail for error popups
         last.append(line.rstrip())
         if len(last) > 60:
             last.pop(0)
