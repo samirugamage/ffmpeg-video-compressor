@@ -1,0 +1,44 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Install ffmpeg via Chocolatey
+        run: choco install ffmpeg -y
+
+      - name: Locate ffmpeg
+        shell: pwsh
+        run: |
+          $ff = (Get-Command ffmpeg).Source
+          "FFMPEG_EXE=$ff" | Out-File -FilePath $Env:GITHUB_ENV -Append
+          Write-Host "ffmpeg at $ff"
+
+      - name: Build one file exe
+        shell: pwsh
+        run: |
+          pyinstaller --name FFmpegCompressor --onefile --noconsole gui_ffmpeg_compressor.py --add-binary "$Env:FFMPEG_EXE;."
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FFmpegCompressor-Windows
+          path: dist/FFmpegCompressor.exe
