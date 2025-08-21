@@ -80,13 +80,34 @@ def find_ffmpeg():
     return "ffmpeg"
 
 
+def find_ffprobe(ffmpeg_path):
+    # Try next to ffmpeg
+    ffdir = os.path.dirname(ffmpeg_path)
+    # Windows
+    cand = os.path.join(ffdir, "ffprobe.exe")
+    if os.path.exists(cand):
+        return cand
+    # Unix
+    cand = os.path.join(ffdir, "ffprobe")
+    if os.path.exists(cand):
+        return cand
+    # PATH
+    on_path = shutil.which("ffprobe")
+    return on_path or "ffprobe"
+
+
+def platform_null_sink():
+    return "NUL" if os.name == "nt" else "/dev/null"
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("900x650")
+        root.geometry("980x820")
 
         self.ffmpeg_path = find_ffmpeg()
+        self.ffprobe_path = find_ffprobe(self.ffmpeg_path)
         self.input_files = []  # absolute paths
 
         # job control
@@ -96,6 +117,20 @@ class App:
         self.current_proc = None  # subprocess.Popen for ffmpeg
         self.is_running = False
 
+        # plan and progress tracking
+        self.plan = {}               # path -> {"duration": sec, "passes": 1 or 2}
+        self.total_work_units = 0.0  # sum(duration * passes)
+        self.work_done_units = 0.0   # increases as encoding progresses
+        self.batch_start_ts = None
+        self.cur_file = None
+        self.cur_pass_index = 1
+        self.cur_pass_count = 1
+        self.failed_files = []
+        self.last_speed_x = 1.0      # last reported "speed=" from ffmpeg
+        self.cur_file_start_ts = None
+        self.cur_file_pass_progress_sec = 0.0  # seconds progressed in current pass
+
+        # settings
         self.mode = tk.StringVar(value="crf")       # "crf" or "bitrate"
         self.crf = tk.IntVar(value=23)              # 14..35
         self.bitrate_kbps = tk.IntVar(value=2500)   # for bitrate mode
@@ -108,6 +143,23 @@ class App:
         self.res_choice = tk.StringVar(value=RESOLUTION_PRESETS[0][0])  # label
         self.custom_width = tk.IntVar(value=1280)
 
+        # UI progress vars
+        self.total_progress_var = tk.DoubleVar(value=0.0)   # 0..100
+        self.current_progress_var = tk.DoubleVar(value=0.0) # 0..100
+
+        self.total_count_lbl_var = tk.StringVar(value="0 / 0")
+        self.total_percent_lbl_var = tk.StringVar(value="0.0%")
+        self.current_percent_lbl_var = tk.StringVar(value="0.0%")
+
+        self.total_eta_lbl_var = tk.StringVar(value="ETA total: --:--:--")
+        self.current_eta_lbl_var = tk.StringVar(value="ETA current: --:--:--")
+        self.elapsed_lbl_var = tk.StringVar(value="Elapsed: 00:00:00")
+        self.current_name_lbl_var = tk.StringVar(value="Current: —")
+        self.current_pass_lbl_var = tk.StringVar(value="Pass: —")
+        self.speed_lbl_var = tk.StringVar(value="Speed: —")
+
+        self.completed_count = 0
+
         self._build_ui()
         self._update_mode_visibility()
         self._update_suggestions()
@@ -115,6 +167,9 @@ class App:
 
         if psutil is None:
             self.log_write("Warning: psutil not installed. Pause/Resume mid-file will be disabled.\n")
+
+        # tick to update elapsed time and ETAs regularly
+        self._ui_tick()
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -229,14 +284,53 @@ class App:
         self.stop_btn = ttk.Button(run_frame, text="Quit", command=self.root.destroy)
         self.stop_btn.pack(side="left", padx=8)
 
+        # Progress group
+        prog = ttk.LabelFrame(self.root, text="Progress")
+        prog.pack(fill="x", **pad)
+
+        # Total progress
+        ttk.Label(prog, text="Total").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.total_bar = ttk.Progressbar(prog, variable=self.total_progress_var, maximum=100.0)
+        self.total_bar.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+        prog.columnconfigure(1, weight=1)
+        ttk.Label(prog, textvariable=self.total_percent_lbl_var, width=10, anchor="e").grid(row=0, column=2, padx=6)
+        ttk.Label(prog, textvariable=self.total_count_lbl_var, width=12, anchor="e").grid(row=0, column=3, padx=6)
+
+        # Current video progress
+        ttk.Label(prog, text="Current").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.cur_bar = ttk.Progressbar(prog, variable=self.current_progress_var, maximum=100.0)
+        self.cur_bar.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(prog, textvariable=self.current_percent_lbl_var, width=10, anchor="e").grid(row=1, column=2, padx=6)
+        ttk.Label(prog, textvariable=self.current_name_lbl_var, anchor="w").grid(row=2, column=0, columnspan=4, sticky="w", padx=6)
+
+        # ETAs and status line
+        status = ttk.Frame(self.root)
+        status.pack(fill="x", **pad)
+        ttk.Label(status, textvariable=self.current_eta_lbl_var).pack(side="left", padx=6)
+        ttk.Label(status, text="  ").pack(side="left")
+        ttk.Label(status, textvariable=self.total_eta_lbl_var).pack(side="left", padx=6)
+        ttk.Label(status, text="  ").pack(side="left")
+        ttk.Label(status, textvariable=self.elapsed_lbl_var).pack(side="left", padx=6)
+        ttk.Label(status, text="  ").pack(side="left")
+        ttk.Label(status, textvariable=self.current_pass_lbl_var).pack(side="left", padx=6)
+        ttk.Label(status, text="  ").pack(side="left")
+        ttk.Label(status, textvariable=self.speed_lbl_var).pack(side="left", padx=6)
+
+        # Failed list
+        fail_frame = ttk.LabelFrame(self.root, text="Videos not compressed")
+        fail_frame.pack(fill="both", **pad)
+        self.fail_list = tk.Listbox(fail_frame, height=4)
+        self.fail_list.pack(fill="both", expand=True, padx=6, pady=6)
+
         # Log
         log_frame = ttk.LabelFrame(self.root, text="Log")
         log_frame.pack(fill="both", expand=True, **pad)
-        self.log = tk.Text(log_frame, height=15)
+        self.log = tk.Text(log_frame, height=12)
         self.log.pack(fill="both", expand=True, padx=6, pady=6)
 
         # Show ffmpeg path
         self.log_write(f"Using ffmpeg at: {self.ffmpeg_path}\n")
+        self.log_write(f"Using ffprobe at: {self.ffprobe_path}\n")
 
         # react to resolution changes
         self.res_choice.trace_add("write", lambda *_: self._update_suggestions())
@@ -254,7 +348,7 @@ class App:
         self._append_files(files)
 
     def add_folders(self):
-        # Tk doesn't support multi-select directories, so loop until user cancels
+        # Tk does not support multi-select directories, so loop until user cancels
         while True:
             folder = filedialog.askdirectory(title="Choose a folder (Cancel to finish)")
             if not folder:
@@ -381,7 +475,7 @@ class App:
             if self.twopass.get() and not self._is_gpu_encoder(self.codec.get()):
                 txt += "\nTwo pass gives tighter sizes for bitrate mode."
         if self._is_gpu_encoder(self.codec.get()):
-            txt += "\nNote: Two-pass is CPU-only; hardware encoders use single-pass VBR/CQ."
+            txt += "\nNote: Two-pass is CPU-only; hardware encoders use single-pass VBR or CQ."
         self.suggestion_lbl.config(text=txt)
 
     # ---------- Run / Pause / Resume ----------
@@ -390,13 +484,49 @@ class App:
             messagebox.showerror("No files", "Please add at least one video or folder.")
             return
 
+        # snapshot settings that affect pass count
+        snapshot_codec = self.codec.get()
+        snapshot_mode = self.mode.get()
+        snapshot_twopass = bool(self.twopass.get() and not self._is_gpu_encoder(snapshot_codec))
+
+        # Probe durations and build plan
+        self.plan.clear()
+        total_units = 0.0
+        for src in self.input_files:
+            dur = self._probe_duration(src)
+            passes = 2 if (snapshot_mode == "bitrate" and snapshot_twopass) else 1
+            self.plan[src] = {"duration": dur, "passes": passes}
+            total_units += dur * passes
+
+        self.total_work_units = max(0.001, total_units)
+        self.work_done_units = 0.0
+        self.completed_count = 0
+        self.failed_files = []
+        self.fail_list.delete(0, tk.END)
+        self.total_progress_var.set(0.0)
+        self.current_progress_var.set(0.0)
+        self.total_percent_lbl_var.set("0.0%")
+        self.current_percent_lbl_var.set("0.0%")
+        self.total_count_lbl_var.set(f"0 / {len(self.input_files)}")
+        self.current_eta_lbl_var.set("ETA current: --:--:--")
+        self.total_eta_lbl_var.set("ETA total: --:--:--")
+        self.elapsed_lbl_var.set("Elapsed: 00:00:00")
+        self.current_name_lbl_var.set("Current: —")
+        self.current_pass_lbl_var.set("Pass: —")
+        self.speed_lbl_var.set("Speed: —")
+
         self.start_btn.config(state="disabled")
         self.pause_btn.config(state="normal")
         self.resume_btn.config(state="disabled")
         self.is_running = True
         self.pause_flag.set()
+        self.batch_start_ts = time.time()
 
-        self.worker_thread = threading.Thread(target=self._run_all, daemon=True)
+        self.worker_thread = threading.Thread(
+            target=self._run_all,
+            args=(snapshot_mode, snapshot_twopass, snapshot_codec),
+            daemon=True
+        )
         self.worker_thread.start()
 
     def pause(self):
@@ -429,25 +559,64 @@ class App:
         self.pause_btn.config(state="normal")
         self.resume_btn.config(state="disabled")
 
-    def _run_all(self):
+    def _run_all(self, snapshot_mode, snapshot_twopass, snapshot_codec):
         try:
-            for src in list(self.input_files):
+            total_files = len(self.input_files)
+            for idx, src in enumerate(list(self.input_files), start=1):
                 # allow pause between files
                 while not self.pause_flag.is_set():
                     time.sleep(0.2)
 
-                self._convert_one(src)
+                self.cur_file = src
+                self.current_name_lbl_var.set(f"Current: {os.path.basename(src)}")
+                self.cur_file_start_ts = time.time()
+
+                try:
+                    self._convert_one(
+                        src,
+                        two_pass=(snapshot_mode == "bitrate" and snapshot_twopass),
+                        snapshot_codec=snapshot_codec
+                    )
+                    self.completed_count += 1
+                except Exception as e:
+                    self.failed_files.append(src)
+                    self.fail_list.insert(tk.END, src)
+                    self.log_write(f"[ERROR] {os.path.basename(src)} failed. {e}\n")
+                    # On error, add any remaining pass work for this file as done to keep ETA consistent
+                    if self.plan.get(src, {}).get("passes", 1) == 2:
+                        # if we failed in pass1, we did some portion of pass1 but not pass2
+                        # to keep percentages monotonic and continue, mark the rest of this file's planned work as done
+                        remaining = self.plan[src]["duration"] * (2)  # 2 passes worth
+                        # subtract what we actually counted from pass progress so far
+                        # simpler approach: add the whole file work now so total keeps moving
+                        self.work_done_units += max(0.0, remaining - self.cur_file_pass_progress_sec)
+                    else:
+                        remaining = self.plan[src]["duration"]
+                        self.work_done_units += max(0.0, remaining - self.cur_file_pass_progress_sec)
+
+                # update total count label
+                self.total_count_lbl_var.set(f"{self.completed_count} / {total_files}")
+
             self.log_write("All done.\n")
-            messagebox.showinfo("Done", "All conversions finished.")
-        except Exception as e:
-            self.log_write(f"Error: {e}\n")
-            messagebox.showerror("Error", str(e))
+            if self.failed_files:
+                messagebox.showwarning(
+                    "Done with errors",
+                    f"Finished with {len(self.failed_files)} failure(s). See list and log."
+                )
+            else:
+                messagebox.showinfo("Done", "All conversions finished.")
         finally:
             self.is_running = False
             self.start_btn.config(state="normal")
             self.pause_btn.config(state="disabled")
             self.resume_btn.config(state="disabled")
             self.current_proc = None
+            self.cur_file = None
+            self.current_name_lbl_var.set("Current: —")
+            self.current_pass_lbl_var.set("Pass: —")
+            self.speed_lbl_var.set("Speed: —")
+            self.current_eta_lbl_var.set("ETA current: --:--:--")
+            self.total_eta_lbl_var.set("ETA total: --:--:--")
 
     # ---------- Encoding ----------
     def _map_preset_args(self, vcodec, preset):
@@ -472,10 +641,10 @@ class App:
             return ["-quality", "quality"]
         return []
 
-    def _convert_one(self, src_path):
+    def _convert_one(self, src_path, two_pass, snapshot_codec):
         base = os.path.splitext(os.path.basename(src_path))[0]
 
-        # NEW: per-source folder output subdir
+        # per-source folder output subdir
         src_dir = os.path.dirname(src_path)
         outdir = os.path.join(src_dir, "compressed videos")
         os.makedirs(outdir, exist_ok=True)
@@ -496,17 +665,22 @@ class App:
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
             hw_flags = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif vcodec in ("h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"):
+            # works on Windows, on Linux this may be ignored
             hw_flags = ["-hwaccel", "d3d11va"]
 
         common = [
             self.ffmpeg_path, "-y",
             "-hide_banner",
+            "-progress", "pipe:1",  # machine readable progress on stdout
         ] + hw_flags + [
             "-i", src_path,
             "-map", "0:v:0?",
             "-map", "0:a:0?",
             "-c:v", vcodec,
         ] + self._map_preset_args(vcodec, preset) + vf_args
+
+        duration = float(self.plan.get(src_path, {}).get("duration", 0.0))
+        self.cur_file_pass_progress_sec = 0.0
 
         if self.mode.get() == "crf":
             c = int(self.crf.get())
@@ -530,22 +704,30 @@ class App:
                 "-movflags", "+faststart",
                 dst_path
             ]
-            self._run_ffmpeg(args)
-
+            self.cur_pass_index = 1
+            self.cur_pass_count = 1
+            self.current_pass_lbl_var.set("Pass: 1 / 1")
+            self._run_ffmpeg_with_progress(args, duration, pass_index=1, pass_count=1)
         else:
             kbps = str(self.bitrate_kbps.get()) + "k"
-            if self.twopass.get() and vcodec in ("libx264", "libx265"):
+            if two_pass and vcodec in ("libx264", "libx265"):
                 with tempfile.TemporaryDirectory() as td:
                     logf = os.path.join(td, "ffpass.log")
+                    # First pass
                     args1 = common + [
                         "-b:v", kbps,
                         "-pass", "1",
                         "-passlogfile", logf,
                         "-an",
                         "-f", "mp4",
-                        "NUL"
+                        platform_null_sink()
                     ]
-                    self._run_ffmpeg(args1)
+                    self.cur_pass_index = 1
+                    self.cur_pass_count = 2
+                    self.current_pass_lbl_var.set("Pass: 1 / 2")
+                    self._run_ffmpeg_with_progress(args1, duration, pass_index=1, pass_count=2)
+
+                    # Second pass
                     args2 = common + [
                         "-b:v", kbps,
                         "-pass", "2",
@@ -555,8 +737,14 @@ class App:
                         "-movflags", "+faststart",
                         dst_path
                     ]
-                    self._run_ffmpeg(args2)
+                    self.cur_pass_index = 2
+                    self.cur_pass_count = 2
+                    self.current_pass_lbl_var.set("Pass: 2 / 2")
+                    # reset per-pass progress for a clean progress display
+                    self.cur_file_pass_progress_sec = 0.0
+                    self._run_ffmpeg_with_progress(args2, duration, pass_index=2, pass_count=2)
             else:
+                # single pass
                 v_args = []
                 if vcodec in ("h264_nvenc", "hevc_nvenc"):
                     v_args = ["-rc", "vbr", "-b:v", kbps, "-tune", "hq"]
@@ -573,7 +761,10 @@ class App:
                     "-movflags", "+faststart",
                     dst_path
                 ]
-                self._run_ffmpeg(args)
+                self.cur_pass_index = 1
+                self.cur_pass_count = 1
+                self.current_pass_lbl_var.set("Pass: 1 / 1")
+                self._run_ffmpeg_with_progress(args, duration, pass_index=1, pass_count=1)
 
         self.log_write(f"Saved: {dst_path}\n")
 
@@ -587,34 +778,208 @@ class App:
         if choice is None:
             return None
         if choice == "custom":
-            w = max(16, int(self.custom_width.get()))
+            try:
+                w = max(16, int(self.custom_width.get()))
+            except Exception:
+                w = 1280
             return f"scale={w}:-2"
         w, h = choice
         return f"scale={w}:{h}"
 
-    # ---------- Subprocess driver with pause-aware UI ----------
-    def _run_ffmpeg(self, args):
+    # ---------- Subprocess driver with progress parsing ----------
+    def _run_ffmpeg_with_progress(self, args, duration_sec, pass_index=1, pass_count=1):
+        # Note: using -progress pipe:1, ffmpeg writes machine readable lines on stdout
+        # We still redirect stderr to stdout so we capture any errors in the same stream
         self.log_write(" ".join([self._quote(a) for a in args]) + "\n")
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
         self.current_proc = proc
-        last = []
+        last_lines = []
+        out_time_sec = 0.0
+        self.cur_file_pass_progress_sec = 0.0
+        self.last_speed_x = 1.0
+
         try:
-            for line in proc.stdout:
+            for raw in proc.stdout:
+                if raw is None:
+                    continue
+                line = raw.strip()
                 if not line:
                     continue
-                self.log_write(line)
-                last.append(line.rstrip())
-                if len(last) > 80:
-                    last.pop(0)
-        finally:
+
+                # keep a short tail for error reporting
+                last_lines.append(line)
+                if len(last_lines) > 120:
+                    last_lines.pop(0)
+
+                # -progress emits key=value lines
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                else:
+                    key, val = "", ""
+
+                if key == "out_time_ms":
+                    try:
+                        out_time_sec = max(0.0, float(val) / 1_000_000.0)
+                    except Exception:
+                        pass
+                    self.cur_file_pass_progress_sec = out_time_sec
+
+                    # current video percent
+                    cur_pct = 0.0
+                    if duration_sec > 0:
+                        frac = min(1.0, out_time_sec / duration_sec)
+                        if pass_count == 2:
+                            # map to half for each pass in UI current progress
+                            cur_pct = frac * 100.0
+                        else:
+                            cur_pct = frac * 100.0
+                    self.current_progress_var.set(cur_pct)
+                    self.current_percent_lbl_var.set(f"{cur_pct:.1f}%")
+
+                    # update total progress based on work units
+                    # Each pass counts duration_sec units
+                    worked_units = out_time_sec  # progressed seconds in this pass
+                    # Total done so far equals already finished previous files and passes plus current pass worked
+                    # self.work_done_units accumulates at the end of each pass by adding duration_sec
+                    total_done = self.work_done_units + worked_units
+                    total_pct = min(100.0, max(0.0, (total_done / self.total_work_units) * 100.0))
+                    self.total_progress_var.set(total_pct)
+                    self.total_percent_lbl_var.set(f"{total_pct:.1f}%")
+
+                    # ETA current
+                    eta_cur = self._eta_seconds(
+                        remaining_sec=max(0.0, duration_sec - out_time_sec),
+                        speed_x=self.last_speed_x
+                    )
+                    self.current_eta_lbl_var.set(f"ETA current: {self._fmt_hms(eta_cur)}")
+
+                    # ETA total
+                    # Remaining work units = current pass remaining + remaining passes for current file + other files' passes
+                    remaining_current_pass = max(0.0, duration_sec - out_time_sec)
+                    remaining_passes_this_file = 0.0
+                    if pass_count == 2 and pass_index == 1:
+                        remaining_passes_this_file += duration_sec  # full pass 2 still pending
+
+                    remaining_other_files = 0.0
+                    after = False
+                    for f in self.input_files:
+                        if f == self.cur_file:
+                            after = True
+                            continue
+                        if after:
+                            info = self.plan.get(f, {"duration": 0.0, "passes": 1})
+                            remaining_other_files += info["duration"] * info["passes"]
+
+                    total_remaining_units = remaining_current_pass + remaining_passes_this_file + remaining_other_files
+                    eta_total = self._eta_seconds(remaining_sec=total_remaining_units, speed_x=self.last_speed_x)
+                    self.total_eta_lbl_var.set(f"ETA total: {self._fmt_hms(eta_total)}")
+
+                    # speed label
+                    self.speed_lbl_var.set(f"Speed: {self.last_speed_x:.2f}x")
+
+                    # flush UI
+                    self.root.update_idletasks()
+
+                elif key == "speed":
+                    # like "1.23x"
+                    try:
+                        if val.endswith("x"):
+                            self.last_speed_x = max(0.01, float(val[:-1]))
+                        else:
+                            self.last_speed_x = max(0.01, float(val))
+                    except Exception:
+                        pass
+                elif key == "progress":
+                    # "continue" or "end"
+                    pass
+                else:
+                    # also show logs in the log view for visibility, but keep it light
+                    if key == "" and line:
+                        # free text lines
+                        self.log_write(line + "\n")
+
             proc.wait()
             self.current_proc = None
 
+        finally:
+            self.current_proc = None
+
         if proc.returncode != 0:
-            tail = "\n".join(last)
+            tail = "\n".join(last_lines[-40:])
             raise RuntimeError(f"ffmpeg failed with code {proc.returncode}\n\nLast lines:\n{tail}")
 
+        # pass completed successfully, advance work units
+        self.work_done_units += duration_sec
+
+        # if this was pass 2 of 2, add one more duration worth for the second pass completion
+        if pass_count == 2 and pass_index == 2:
+            # We already added duration_sec at the end of pass 1 in that call
+            # and again here for pass 2. No extra action needed.
+            pass
+
+    # ---------- Probing ----------
+    def _probe_duration(self, path):
+        # Try ffprobe json-less scalar output
+        try:
+            out = subprocess.check_output(
+                [self.ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                universal_newlines=True, stderr=subprocess.STDOUT
+            )
+            dur = float(out.strip())
+            if dur > 0:
+                return dur
+        except Exception:
+            pass
+
+        # Fallback: parse "Duration: HH:MM:SS.xx" from ffmpeg -i
+        try:
+            out = subprocess.check_output(
+                [self.ffmpeg_path, "-hide_banner", "-i", path],
+                universal_newlines=True, stderr=subprocess.STDOUT
+            )
+        except subprocess.CalledProcessError as e:
+            out = e.output or ""
+
+        for line in out.splitlines():
+            line = line.strip()
+            if "Duration:" in line:
+                try:
+                    part = line.split("Duration:", 1)[1].split(",", 1)[0].strip()
+                    h, m, s = part.split(":")
+                    dur = int(h) * 3600 + int(m) * 60 + float(s)
+                    if dur > 0:
+                        return dur
+                except Exception:
+                    pass
+
+        # Unknown duration, assume small nonzero to avoid division by zero
+        self.log_write(f"[WARN] Could not probe duration for {os.path.basename(path)}. Assuming 60s.\n")
+        return 60.0
+
     # ---------- Utils ----------
+    def _ui_tick(self):
+        # update elapsed label and keep ticking
+        if self.batch_start_ts:
+            elapsed = int(time.time() - self.batch_start_ts)
+            self.elapsed_lbl_var.set(f"Elapsed: {self._fmt_hms(elapsed)}")
+        self.root.after(500, self._ui_tick)
+
+    def _eta_seconds(self, remaining_sec, speed_x):
+        # avoid division by very small speed
+        spd = max(0.05, float(speed_x or 1.0))
+        return int(remaining_sec / spd)
+
+    def _fmt_hms(self, secs):
+        try:
+            s = int(max(0, secs))
+        except Exception:
+            s = 0
+        h = s // 3600
+        m = (s % 3600) // 60
+        s2 = s % 60
+        return f"{h:02d}:{m:02d}:{s2:02d}"
+
     def log_write(self, s):
         self.log.insert(tk.END, s)
         self.log.see(tk.END)
@@ -622,16 +987,22 @@ class App:
 
     @staticmethod
     def _quote(s):
-        if " " in s:
+        if isinstance(s, str) and " " in s:
             return f"\"{s}\""
-        return s
+        return str(s)
 
 
 def main():
     root = tk.Tk()
     style = ttk.Style()
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
+    try:
+        # prefer modern theme if present
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        elif "clam" in style.theme_names():
+            style.theme_use("clam")
+    except Exception:
+        pass
     App(root)
     root.mainloop()
 
