@@ -83,15 +83,12 @@ def find_ffmpeg():
 def find_ffprobe(ffmpeg_path):
     # Try next to ffmpeg
     ffdir = os.path.dirname(ffmpeg_path)
-    # Windows
     cand = os.path.join(ffdir, "ffprobe.exe")
     if os.path.exists(cand):
         return cand
-    # Unix
     cand = os.path.join(ffdir, "ffprobe")
     if os.path.exists(cand):
         return cand
-    # PATH
     on_path = shutil.which("ffprobe")
     return on_path or "ffprobe"
 
@@ -104,7 +101,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("980x820")
+        root.geometry("980x860")
 
         self.ffmpeg_path = find_ffmpeg()
         self.ffprobe_path = find_ffprobe(self.ffmpeg_path)
@@ -113,39 +110,39 @@ class App:
         # job control
         self.worker_thread = None
         self.pause_flag = threading.Event()
-        self.pause_flag.set()  # running by default
-        self.current_proc = None  # subprocess.Popen for ffmpeg
+        self.pause_flag.set()
+        self.current_proc = None
         self.is_running = False
 
         # plan and progress tracking
         self.plan = {}               # path -> {"duration": sec, "passes": 1 or 2}
         self.total_work_units = 0.0  # sum(duration * passes)
-        self.work_done_units = 0.0   # increases as encoding progresses
+        self.work_done_units = 0.0
         self.batch_start_ts = None
         self.cur_file = None
         self.cur_pass_index = 1
         self.cur_pass_count = 1
         self.failed_files = []
-        self.last_speed_x = 1.0      # last reported "speed=" from ffmpeg
+        self.last_speed_x = 1.0
         self.cur_file_start_ts = None
-        self.cur_file_pass_progress_sec = 0.0  # seconds progressed in current pass
+        self.cur_file_pass_progress_sec = 0.0
 
         # settings
         self.mode = tk.StringVar(value="crf")       # "crf" or "bitrate"
-        self.crf = tk.IntVar(value=23)              # 14..35
-        self.bitrate_kbps = tk.IntVar(value=2500)   # for bitrate mode
+        self.crf = tk.IntVar(value=23)
+        self.bitrate_kbps = tk.IntVar(value=2500)
         self.twopass = tk.BooleanVar(value=True)    # CPU only
 
         self.codec = tk.StringVar(value="libx264")
         self.vpreset = tk.StringVar(value="medium")
         self.abitrate = tk.StringVar(value="128k")
 
-        self.res_choice = tk.StringVar(value=RESOLUTION_PRESETS[0][0])  # label
+        self.res_choice = tk.StringVar(value=RESOLUTION_PRESETS[0][0])
         self.custom_width = tk.IntVar(value=1280)
 
         # UI progress vars
-        self.total_progress_var = tk.DoubleVar(value=0.0)   # 0..100
-        self.current_progress_var = tk.DoubleVar(value=0.0) # 0..100
+        self.total_progress_var = tk.DoubleVar(value=0.0)
+        self.current_progress_var = tk.DoubleVar(value=0.0)
 
         self.total_count_lbl_var = tk.StringVar(value="0 / 0")
         self.total_percent_lbl_var = tk.StringVar(value="0.0%")
@@ -160,6 +157,9 @@ class App:
 
         self.completed_count = 0
 
+        # compare & prune summary
+        self.prune_summary_var = tk.StringVar(value="Compare & Prune: not run")
+
         self._build_ui()
         self._update_mode_visibility()
         self._update_suggestions()
@@ -168,7 +168,6 @@ class App:
         if psutil is None:
             self.log_write("Warning: psutil not installed. Pause/Resume mid-file will be disabled.\n")
 
-        # tick to update elapsed time and ETAs regularly
         self._ui_tick()
 
     # ---------- UI ----------
@@ -259,13 +258,6 @@ class App:
         self.cw_entry.pack(side="left")
         ttk.Label(res_frame, text="Height keeps aspect").pack(side="left", padx=8)
 
-        # Audio
-        aud_frame = ttk.LabelFrame(self.root, text="Audio")
-        aud_frame.pack(fill="x", **pad)
-        ttk.Label(aud_frame, text="Bitrate").pack(side="left")
-        ttk.Combobox(aud_frame, textvariable=self.abitrate, values=AUDIO_BR_CHOICES,
-                     width=8, state="readonly").pack(side="left", padx=8)
-
         # Suggestions
         sug_frame = ttk.LabelFrame(self.root, text="Suggestions")
         sug_frame.pack(fill="x", **pad)
@@ -288,7 +280,6 @@ class App:
         prog = ttk.LabelFrame(self.root, text="Progress")
         prog.pack(fill="x", **pad)
 
-        # Total progress
         ttk.Label(prog, text="Total").grid(row=0, column=0, sticky="w", padx=6, pady=4)
         self.total_bar = ttk.Progressbar(prog, variable=self.total_progress_var, maximum=100.0)
         self.total_bar.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
@@ -296,14 +287,12 @@ class App:
         ttk.Label(prog, textvariable=self.total_percent_lbl_var, width=10, anchor="e").grid(row=0, column=2, padx=6)
         ttk.Label(prog, textvariable=self.total_count_lbl_var, width=12, anchor="e").grid(row=0, column=3, padx=6)
 
-        # Current video progress
         ttk.Label(prog, text="Current").grid(row=1, column=0, sticky="w", padx=6, pady=4)
         self.cur_bar = ttk.Progressbar(prog, variable=self.current_progress_var, maximum=100.0)
         self.cur_bar.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
         ttk.Label(prog, textvariable=self.current_percent_lbl_var, width=10, anchor="e").grid(row=1, column=2, padx=6)
         ttk.Label(prog, textvariable=self.current_name_lbl_var, anchor="w").grid(row=2, column=0, columnspan=4, sticky="w", padx=6)
 
-        # ETAs and status line
         status = ttk.Frame(self.root)
         status.pack(fill="x", **pad)
         ttk.Label(status, textvariable=self.current_eta_lbl_var).pack(side="left", padx=6)
@@ -315,6 +304,12 @@ class App:
         ttk.Label(status, textvariable=self.current_pass_lbl_var).pack(side="left", padx=6)
         ttk.Label(status, text="  ").pack(side="left")
         ttk.Label(status, textvariable=self.speed_lbl_var).pack(side="left", padx=6)
+
+        # Compare & Prune controls
+        prune_frame = ttk.LabelFrame(self.root, text="Compare & Prune")
+        prune_frame.pack(fill="x", **pad)
+        ttk.Button(prune_frame, text="Compare & Prune Now", command=self.compare_and_prune_now).pack(side="left", padx=6)
+        ttk.Label(prune_frame, textvariable=self.prune_summary_var).pack(side="left", padx=12)
 
         # Failed list
         fail_frame = ttk.LabelFrame(self.root, text="Videos not compressed")
@@ -328,11 +323,9 @@ class App:
         self.log = tk.Text(log_frame, height=12)
         self.log.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # Show ffmpeg path
         self.log_write(f"Using ffmpeg at: {self.ffmpeg_path}\n")
         self.log_write(f"Using ffprobe at: {self.ffprobe_path}\n")
 
-        # react to resolution changes
         self.res_choice.trace_add("write", lambda *_: self._update_suggestions())
         self.custom_width.trace_add("write", lambda *_: self._update_suggestions())
 
@@ -348,7 +341,6 @@ class App:
         self._append_files(files)
 
     def add_folders(self):
-        # Tk does not support multi-select directories, so loop until user cancels
         while True:
             folder = filedialog.askdirectory(title="Choose a folder (Cancel to finish)")
             if not folder:
@@ -484,7 +476,6 @@ class App:
             messagebox.showerror("No files", "Please add at least one video or folder.")
             return
 
-        # snapshot settings that affect pass count
         snapshot_codec = self.codec.get()
         snapshot_mode = self.mode.get()
         snapshot_twopass = bool(self.twopass.get() and not self._is_gpu_encoder(snapshot_codec))
@@ -514,6 +505,7 @@ class App:
         self.current_name_lbl_var.set("Current: —")
         self.current_pass_lbl_var.set("Pass: —")
         self.speed_lbl_var.set("Speed: —")
+        self.prune_summary_var.set("Compare & Prune: not run")
 
         self.start_btn.config(state="disabled")
         self.pause_btn.config(state="normal")
@@ -532,10 +524,9 @@ class App:
     def pause(self):
         if not self.is_running:
             return
-        self.pause_flag.clear()  # pause between files
+        self.pause_flag.clear()
         self.pause_btn.config(state="disabled")
         self.resume_btn.config(state="normal")
-        # try mid-file pause via psutil
         if psutil and self.current_proc and self.current_proc.poll() is None:
             try:
                 psutil.Process(self.current_proc.pid).suspend()
@@ -548,7 +539,6 @@ class App:
     def resume(self):
         if not self.is_running:
             return
-        # resume process first
         if psutil and self.current_proc and self.current_proc.poll() is None:
             try:
                 psutil.Process(self.current_proc.pid).resume()
@@ -563,7 +553,6 @@ class App:
         try:
             total_files = len(self.input_files)
             for idx, src in enumerate(list(self.input_files), start=1):
-                # allow pause between files
                 while not self.pause_flag.is_set():
                     time.sleep(0.2)
 
@@ -582,20 +571,14 @@ class App:
                     self.failed_files.append(src)
                     self.fail_list.insert(tk.END, src)
                     self.log_write(f"[ERROR] {os.path.basename(src)} failed. {e}\n")
-                    # On error, add any remaining pass work for this file as done to keep ETA consistent
-                    if self.plan.get(src, {}).get("passes", 1) == 2:
-                        # if we failed in pass1, we did some portion of pass1 but not pass2
-                        # to keep percentages monotonic and continue, mark the rest of this file's planned work as done
-                        remaining = self.plan[src]["duration"] * (2)  # 2 passes worth
-                        # subtract what we actually counted from pass progress so far
-                        # simpler approach: add the whole file work now so total keeps moving
-                        self.work_done_units += max(0.0, remaining - self.cur_file_pass_progress_sec)
-                    else:
-                        remaining = self.plan[src]["duration"]
-                        self.work_done_units += max(0.0, remaining - self.cur_file_pass_progress_sec)
+                    # mark remaining planned work for this file as done to keep ETA advancing
+                    planned = self.plan.get(src, {}).get("duration", 0.0) * self.plan.get(src, {}).get("passes", 1)
+                    self.work_done_units += max(0.0, planned - self.cur_file_pass_progress_sec)
 
-                # update total count label
                 self.total_count_lbl_var.set(f"{self.completed_count} / {total_files}")
+
+            # Auto compare and prune after batch
+            self._compare_and_prune()
 
             self.log_write("All done.\n")
             if self.failed_files:
@@ -624,15 +607,9 @@ class App:
             return ["-preset", preset]
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
             map_nv = {
-                "ultrafast": "p1",
-                "superfast": "p2",
-                "veryfast":  "p3",
-                "faster":     "p3",
-                "fast":       "p4",
-                "medium":     "p4",
-                "slow":       "p5",
-                "slower":     "p6",
-                "veryslow":   "p7",
+                "ultrafast": "p1", "superfast": "p2", "veryfast": "p3",
+                "faster": "p3", "fast": "p4", "medium": "p4",
+                "slow": "p5", "slower": "p6", "veryslow": "p7",
             }
             return ["-preset", map_nv.get(preset, "p4"), "-tune", "hq"]
         if vcodec in ("h264_qsv", "hevc_qsv"):
@@ -643,35 +620,28 @@ class App:
 
     def _convert_one(self, src_path, two_pass, snapshot_codec):
         base = os.path.splitext(os.path.basename(src_path))[0]
-
-        # per-source folder output subdir
         src_dir = os.path.dirname(src_path)
         outdir = os.path.join(src_dir, "compressed videos")
         os.makedirs(outdir, exist_ok=True)
-
-        dst_path = os.path.join(outdir, f"{base}.mp4")  # same name, separate folder
+        dst_path = os.path.join(outdir, f"{base}.mp4")
 
         vcodec = self.codec.get()
         preset = self.vpreset.get()
         ab = self.abitrate.get()
 
         scale_filter = self._build_scale_filter()
-        vf_args = []
-        if scale_filter:
-            vf_args = ["-vf", scale_filter]
+        vf_args = ["-vf", scale_filter] if scale_filter else []
 
-        # Decode HW accel when using GPU encoders
         hw_flags = []
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
             hw_flags = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif vcodec in ("h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"):
-            # works on Windows, on Linux this may be ignored
             hw_flags = ["-hwaccel", "d3d11va"]
 
         common = [
             self.ffmpeg_path, "-y",
             "-hide_banner",
-            "-progress", "pipe:1",  # machine readable progress on stdout
+            "-progress", "pipe:1",
         ] + hw_flags + [
             "-i", src_path,
             "-map", "0:v:0?",
@@ -740,11 +710,9 @@ class App:
                     self.cur_pass_index = 2
                     self.cur_pass_count = 2
                     self.current_pass_lbl_var.set("Pass: 2 / 2")
-                    # reset per-pass progress for a clean progress display
                     self.cur_file_pass_progress_sec = 0.0
                     self._run_ffmpeg_with_progress(args2, duration, pass_index=2, pass_count=2)
             else:
-                # single pass
                 v_args = []
                 if vcodec in ("h264_nvenc", "hevc_nvenc"):
                     v_args = ["-rc", "vbr", "-b:v", kbps, "-tune", "hq"]
@@ -766,7 +734,16 @@ class App:
                 self.current_pass_lbl_var.set("Pass: 1 / 1")
                 self._run_ffmpeg_with_progress(args, duration, pass_index=1, pass_count=1)
 
-        self.log_write(f"Saved: {dst_path}\n")
+        # Validate output immediately
+        if not self._is_media_ok(dst_path):
+            self.log_write(f"[WARN] Output looks corrupt: {os.path.basename(dst_path)}. Deleting it.\n")
+            self._safe_remove(dst_path)
+            # mark as failed so it appears in the list
+            if src_path not in self.failed_files:
+                self.failed_files.append(src_path)
+                self.fail_list.insert(tk.END, src_path)
+        else:
+            self.log_write(f"Saved: {dst_path}\n")
 
     def _build_scale_filter(self):
         label = self.res_choice.get()
@@ -788,10 +765,9 @@ class App:
 
     # ---------- Subprocess driver with progress parsing ----------
     def _run_ffmpeg_with_progress(self, args, duration_sec, pass_index=1, pass_count=1):
-        # Note: using -progress pipe:1, ffmpeg writes machine readable lines on stdout
-        # We still redirect stderr to stdout so we capture any errors in the same stream
         self.log_write(" ".join([self._quote(a) for a in args]) + "\n")
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                universal_newlines=True, bufsize=1)
         self.current_proc = proc
         last_lines = []
         out_time_sec = 0.0
@@ -806,12 +782,10 @@ class App:
                 if not line:
                     continue
 
-                # keep a short tail for error reporting
                 last_lines.append(line)
                 if len(last_lines) > 120:
                     last_lines.pop(0)
 
-                # -progress emits key=value lines
                 if "=" in line:
                     key, val = line.split("=", 1)
                 else:
@@ -824,41 +798,30 @@ class App:
                         pass
                     self.cur_file_pass_progress_sec = out_time_sec
 
-                    # current video percent
                     cur_pct = 0.0
                     if duration_sec > 0:
                         frac = min(1.0, out_time_sec / duration_sec)
-                        if pass_count == 2:
-                            # map to half for each pass in UI current progress
-                            cur_pct = frac * 100.0
-                        else:
-                            cur_pct = frac * 100.0
+                        cur_pct = frac * 100.0
                     self.current_progress_var.set(cur_pct)
                     self.current_percent_lbl_var.set(f"{cur_pct:.1f}%")
 
-                    # update total progress based on work units
-                    # Each pass counts duration_sec units
-                    worked_units = out_time_sec  # progressed seconds in this pass
-                    # Total done so far equals already finished previous files and passes plus current pass worked
-                    # self.work_done_units accumulates at the end of each pass by adding duration_sec
+                    worked_units = out_time_sec
                     total_done = self.work_done_units + worked_units
                     total_pct = min(100.0, max(0.0, (total_done / self.total_work_units) * 100.0))
                     self.total_progress_var.set(total_pct)
                     self.total_percent_lbl_var.set(f"{total_pct:.1f}%")
 
-                    # ETA current
                     eta_cur = self._eta_seconds(
                         remaining_sec=max(0.0, duration_sec - out_time_sec),
                         speed_x=self.last_speed_x
                     )
                     self.current_eta_lbl_var.set(f"ETA current: {self._fmt_hms(eta_cur)}")
 
-                    # ETA total
-                    # Remaining work units = current pass remaining + remaining passes for current file + other files' passes
+                    # remaining units
                     remaining_current_pass = max(0.0, duration_sec - out_time_sec)
                     remaining_passes_this_file = 0.0
                     if pass_count == 2 and pass_index == 1:
-                        remaining_passes_this_file += duration_sec  # full pass 2 still pending
+                        remaining_passes_this_file += duration_sec
 
                     remaining_other_files = 0.0
                     after = False
@@ -873,15 +836,10 @@ class App:
                     total_remaining_units = remaining_current_pass + remaining_passes_this_file + remaining_other_files
                     eta_total = self._eta_seconds(remaining_sec=total_remaining_units, speed_x=self.last_speed_x)
                     self.total_eta_lbl_var.set(f"ETA total: {self._fmt_hms(eta_total)}")
-
-                    # speed label
                     self.speed_lbl_var.set(f"Speed: {self.last_speed_x:.2f}x")
-
-                    # flush UI
                     self.root.update_idletasks()
 
                 elif key == "speed":
-                    # like "1.23x"
                     try:
                         if val.endswith("x"):
                             self.last_speed_x = max(0.01, float(val[:-1]))
@@ -889,18 +847,8 @@ class App:
                             self.last_speed_x = max(0.01, float(val))
                     except Exception:
                         pass
-                elif key == "progress":
-                    # "continue" or "end"
-                    pass
-                else:
-                    # also show logs in the log view for visibility, but keep it light
-                    if key == "" and line:
-                        # free text lines
-                        self.log_write(line + "\n")
 
             proc.wait()
-            self.current_proc = None
-
         finally:
             self.current_proc = None
 
@@ -911,15 +859,8 @@ class App:
         # pass completed successfully, advance work units
         self.work_done_units += duration_sec
 
-        # if this was pass 2 of 2, add one more duration worth for the second pass completion
-        if pass_count == 2 and pass_index == 2:
-            # We already added duration_sec at the end of pass 1 in that call
-            # and again here for pass 2. No extra action needed.
-            pass
-
-    # ---------- Probing ----------
+    # ---------- Probing and validation ----------
     def _probe_duration(self, path):
-        # Try ffprobe json-less scalar output
         try:
             out = subprocess.check_output(
                 [self.ffprobe_path, "-v", "error", "-select_streams", "v:0",
@@ -932,7 +873,6 @@ class App:
         except Exception:
             pass
 
-        # Fallback: parse "Duration: HH:MM:SS.xx" from ffmpeg -i
         try:
             out = subprocess.check_output(
                 [self.ffmpeg_path, "-hide_banner", "-i", path],
@@ -953,20 +893,154 @@ class App:
                 except Exception:
                     pass
 
-        # Unknown duration, assume small nonzero to avoid division by zero
         self.log_write(f"[WARN] Could not probe duration for {os.path.basename(path)}. Assuming 60s.\n")
         return 60.0
 
+    def _is_media_ok(self, path):
+        # Quick sanity: file must exist and be > 0 bytes
+        try:
+            if not os.path.exists(path) or os.path.getsize(path) <= 0:
+                return False
+        except Exception:
+            return False
+
+        # Must have a video stream
+        try:
+            out = subprocess.check_output(
+                [self.ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+                universal_newlines=True, stderr=subprocess.STDOUT
+            ).strip()
+            if not out:
+                return False
+        except Exception:
+            return False
+
+        # Duration must parse and be positive
+        try:
+            out = subprocess.check_output(
+                [self.ffprobe_path, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", path],
+                universal_newlines=True, stderr=subprocess.STDOUT
+            ).strip()
+            dur = float(out)
+            if not (dur > 0):
+                return False
+        except Exception:
+            return False
+
+        return True
+
+    # ---------- Compare & Prune ----------
+    def compare_and_prune_now(self):
+        if self.is_running:
+            messagebox.showwarning("Busy", "Please wait until current conversions finish before pruning.")
+            return
+        self._compare_and_prune()
+
+    def _compare_and_prune(self):
+        # Scan pairs from the input list. For each original file, look for an mp4 inside its 'compressed videos' subfolder.
+        deleted_originals = 0
+        deleted_compressed = 0
+        corrupt_compressed = 0
+        kept_originals = 0
+        kept_compressed = 0
+        missing_compressed = 0
+
+        seen_fail_added = set()
+
+        for original in self.input_files:
+            base = os.path.splitext(os.path.basename(original))[0]
+            src_dir = os.path.dirname(original)
+            comp_dir = os.path.join(src_dir, "compressed videos")
+            comp_path = os.path.join(comp_dir, f"{base}.mp4")
+
+            if not os.path.exists(comp_path):
+                missing_compressed += 1
+                # mark not compressed
+                if original not in self.failed_files and original not in seen_fail_added:
+                    self.failed_files.append(original)
+                    self.fail_list.insert(tk.END, original)
+                    seen_fail_added.add(original)
+                continue
+
+            # If compressed exists, validate it
+            if not self._is_media_ok(comp_path):
+                self.log_write(f"[PRUNE] Compressed file corrupt. Deleting: {comp_path}\n")
+                self._safe_remove(comp_path)
+                corrupt_compressed += 1
+                kept_originals += 1
+                continue
+
+            # Optional: you can also validate original, but requirement focuses on compressed corruption.
+            # Compare sizes and keep the smaller one
+            try:
+                orig_sz = os.path.getsize(original)
+                comp_sz = os.path.getsize(comp_path)
+            except Exception as e:
+                self.log_write(f"[PRUNE] Size check failed for {base}: {e}\n")
+                continue
+
+            if comp_sz < orig_sz:
+                # keep compressed, delete original
+                try:
+                    self._safe_remove(original)
+                    deleted_originals += 1
+                    kept_compressed += 1
+                    self.log_write(f"[PRUNE] Kept compressed ({self._fmt_bytes(comp_sz)}). Deleted original ({self._fmt_bytes(orig_sz)}): {original}\n")
+                except Exception as e:
+                    self.log_write(f"[PRUNE] Could not delete original {original}: {e}\n")
+            else:
+                # keep original, delete compressed (also if equal size)
+                try:
+                    self._safe_remove(comp_path)
+                    deleted_compressed += 1
+                    kept_originals += 1
+                    self.log_write(f"[PRUNE] Kept original ({self._fmt_bytes(orig_sz)}). Deleted compressed ({self._fmt_bytes(comp_sz)}): {comp_path}\n")
+                except Exception as e:
+                    self.log_write(f"[PRUNE] Could not delete compressed {comp_path}: {e}\n")
+
+        summary = (
+            f"Compare & Prune -> "
+            f"kept_orig={kept_originals}, kept_comp={kept_compressed}, "
+            f"del_orig={deleted_originals}, del_comp={deleted_compressed}, "
+            f"corrupt_comp_deleted={corrupt_compressed}, missing_comp={missing_compressed}"
+        )
+        self.prune_summary_var.set(summary)
+        self.log_write(summary + "\n")
+
     # ---------- Utils ----------
+    def _safe_remove(self, path):
+        try:
+            os.remove(path)
+        except PermissionError:
+            # Try to make writable then delete
+            try:
+                os.chmod(path, 0o666)
+                os.remove(path)
+            except Exception as e:
+                self.log_write(f"[DEL] Permission error removing {path}: {e}\n")
+        except Exception as e:
+            self.log_write(f"[DEL] Error removing {path}: {e}\n")
+
+    def _fmt_bytes(self, n):
+        try:
+            n = float(n)
+        except Exception:
+            return f"{n} B"
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if n < 1024.0:
+                return f"{n:.1f} {unit}"
+            n /= 1024.0
+        return f"{n:.1f} PB"
+
     def _ui_tick(self):
-        # update elapsed label and keep ticking
         if self.batch_start_ts:
             elapsed = int(time.time() - self.batch_start_ts)
             self.elapsed_lbl_var.set(f"Elapsed: {self._fmt_hms(elapsed)}")
         self.root.after(500, self._ui_tick)
 
     def _eta_seconds(self, remaining_sec, speed_x):
-        # avoid division by very small speed
         spd = max(0.05, float(speed_x or 1.0))
         return int(remaining_sec / spd)
 
@@ -996,7 +1070,6 @@ def main():
     root = tk.Tk()
     style = ttk.Style()
     try:
-        # prefer modern theme if present
         if "vista" in style.theme_names():
             style.theme_use("vista")
         elif "clam" in style.theme_names():
