@@ -13,7 +13,13 @@ You can easily adjust **bitrate, quality, resolution**, and more — all without
 - ✅ **Resolution adjuster** — downscale to save storage  
 - ✅ **Bitrate presets** — with hints on quality impact  
 - ✅ **Bundled FFmpeg** — no external install needed  
-- ✅ **Hardware acceleration** — supports `h264_nvenc`, `h264_qsv`, and `hevc_qsv` on supported GPUs  
+- ✅ **Hardware acceleration** — supports `h264_nvenc`, `h264_qsv`, and `hevc_qsv` on supported GPUs
+  
+## ✨ Auto-Deletion / Prune
+- After successful compression, you can enable **auto-delete** to remove the original video files and save disk space.  
+- By default, this is **off** to prevent accidental data loss.  
+- You can enable pruning in the settings menu or with the `--prune` option when running from source.  
+- Safety: auto-delete only runs after verifying that the compressed file was created successfully.
 
 ---
 
