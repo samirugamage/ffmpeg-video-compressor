@@ -8,7 +8,13 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# NEW: process control for pause/resume
+# Optional: safer Recycle Bin deletion
+try:
+    from send2trash import send2trash  # pip install Send2Trash
+except Exception:
+    send2trash = None
+
+# Optional: process control for pause/resume
 try:
     import psutil  # pip install psutil
 except Exception:
@@ -29,7 +35,6 @@ RESOLUTION_PRESETS = [
     ("Custom width",    "custom"),
 ]
 
-# CPU and GPU encoders
 CODEC_CHOICES = [
     ("H.264 (CPU x264)", "libx264"),
     ("H.265 (CPU x265)", "libx265"),
@@ -41,67 +46,48 @@ CODEC_CHOICES = [
     ("H.265 (AMD AMF)", "hevc_amf"),
 ]
 
-PRESETS = [
-    "ultrafast",
-    "superfast",
-    "veryfast",
-    "faster",
-    "fast",
-    "medium",
-    "slow",
-    "slower",
-    "veryslow"
-]
-
+PRESETS = ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"]
 AUDIO_BR_CHOICES = ["64k", "96k", "128k", "160k", "192k", "256k"]
-
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v", ".avi", ".webm", ".mts", ".m2ts"}
 
-
 def find_ffmpeg():
-    # Prefer ffmpeg.exe next to the packaged EXE (onedir)
+    # Prefer bundled near the EXE
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
-        bundled = os.path.join(exe_dir, "ffmpeg.exe")
-        if os.path.exists(bundled):
-            return bundled
-        # PyInstaller onefile temp
+        cand = os.path.join(exe_dir, "ffmpeg.exe")
+        if os.path.exists(cand):
+            return cand
         meipass = getattr(sys, '_MEIPASS', None)
         if meipass:
-            candidate = os.path.join(meipass, "ffmpeg.exe")
-            if os.path.exists(candidate):
-                return candidate
-
-    # Fallback to PATH
+            cand = os.path.join(meipass, "ffmpeg.exe")
+            if os.path.exists(cand):
+                return cand
     on_path = shutil.which("ffmpeg")
-    if on_path:
-        return on_path
-
-    return "ffmpeg"
-
+    return on_path or "ffmpeg"
 
 def find_ffprobe(ffmpeg_path):
-    # Try next to ffmpeg
-    ffdir = os.path.dirname(ffmpeg_path)
-    cand = os.path.join(ffdir, "ffprobe.exe")
-    if os.path.exists(cand):
-        return cand
-    cand = os.path.join(ffdir, "ffprobe")
-    if os.path.exists(cand):
-        return cand
+    # Try alongside ffmpeg and inside _MEIPASS, else PATH
+    ffdir = os.path.dirname(ffmpeg_path) if ffmpeg_path else ""
+    cands = []
+    if ffdir:
+        cands += [os.path.join(ffdir, "ffprobe.exe"), os.path.join(ffdir, "ffprobe")]
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        cands += [os.path.join(meipass, "ffprobe.exe"), os.path.join(meipass, "ffprobe")]
+    for c in cands:
+        if os.path.exists(c):
+            return c
     on_path = shutil.which("ffprobe")
     return on_path or "ffprobe"
 
-
 def platform_null_sink():
     return "NUL" if os.name == "nt" else "/dev/null"
-
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("980x860")
+        root.geometry("1000x900")
 
         self.ffmpeg_path = find_ffmpeg()
         self.ffprobe_path = find_ffprobe(self.ffmpeg_path)
@@ -114,7 +100,7 @@ class App:
         self.current_proc = None
         self.is_running = False
 
-        # plan and progress tracking
+        # plan & progress
         self.plan = {}               # path -> {"duration": sec, "passes": 1 or 2}
         self.total_work_units = 0.0  # sum(duration * passes)
         self.work_done_units = 0.0
@@ -128,10 +114,10 @@ class App:
         self.cur_file_pass_progress_sec = 0.0
 
         # settings
-        self.mode = tk.StringVar(value="crf")       # "crf" or "bitrate"
+        self.mode = tk.StringVar(value="crf")     # "crf" or "bitrate"
         self.crf = tk.IntVar(value=23)
         self.bitrate_kbps = tk.IntVar(value=2500)
-        self.twopass = tk.BooleanVar(value=True)    # CPU only
+        self.twopass = tk.BooleanVar(value=True)  # CPU-only
 
         self.codec = tk.StringVar(value="libx264")
         self.vpreset = tk.StringVar(value="medium")
@@ -143,19 +129,15 @@ class App:
         # UI progress vars
         self.total_progress_var = tk.DoubleVar(value=0.0)
         self.current_progress_var = tk.DoubleVar(value=0.0)
-
         self.total_count_lbl_var = tk.StringVar(value="0 / 0")
         self.total_percent_lbl_var = tk.StringVar(value="0.0%")
         self.current_percent_lbl_var = tk.StringVar(value="0.0%")
-
         self.total_eta_lbl_var = tk.StringVar(value="ETA total: --:--:--")
         self.current_eta_lbl_var = tk.StringVar(value="ETA current: --:--:--")
         self.elapsed_lbl_var = tk.StringVar(value="Elapsed: 00:00:00")
         self.current_name_lbl_var = tk.StringVar(value="Current: —")
         self.current_pass_lbl_var = tk.StringVar(value="Pass: —")
         self.speed_lbl_var = tk.StringVar(value="Speed: —")
-
-        self.completed_count = 0
 
         # compare & prune summary
         self.prune_summary_var = tk.StringVar(value="Compare & Prune: not run")
@@ -166,7 +148,10 @@ class App:
         self._log_ffmpeg_version()
 
         if psutil is None:
-            self.log_write("Warning: psutil not installed. Pause/Resume mid-file will be disabled.\n")
+            self.log_write("Warning: psutil not installed. Mid-file Pause/Resume disabled.\n")
+
+        if not self._has_ffprobe():
+            self.log_write("Warning: ffprobe not found. Validation will use ffmpeg decode test.\n")
 
         self._ui_tick()
 
@@ -174,26 +159,18 @@ class App:
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
 
-        # Input
         file_frame = ttk.LabelFrame(self.root, text="Input")
         file_frame.pack(fill="x", **pad)
-
         ttk.Button(file_frame, text="Add Files", command=self.add_files).pack(side="left", padx=6, pady=6)
         ttk.Button(file_frame, text="Add Folders", command=self.add_folders).pack(side="left", padx=6, pady=6)
         ttk.Button(file_frame, text="Remove selected", command=self.remove_selected).pack(side="left", padx=6, pady=6)
-
         self.listbox = tk.Listbox(file_frame, height=7, selectmode=tk.EXTENDED)
         self.listbox.pack(side="left", fill="x", expand=True, padx=6, pady=6)
 
-        # Output note
         out_frame = ttk.LabelFrame(self.root, text="Output location")
         out_frame.pack(fill="x", **pad)
-        ttk.Label(
-            out_frame,
-            text="Each source folder will get a subfolder named 'compressed videos' and outputs go there."
-        ).pack(side="left", padx=6)
+        ttk.Label(out_frame, text="Each source folder gets a subfolder 'compressed videos' for outputs.").pack(side="left", padx=6)
 
-        # Video settings
         vid_frame = ttk.LabelFrame(self.root, text="Video settings")
         vid_frame.pack(fill="x", **pad)
 
@@ -205,7 +182,6 @@ class App:
         ttk.Radiobutton(mode_frame, text="Bitrate (kbps)", variable=self.mode, value="bitrate",
                         command=self._update_mode_visibility).pack(side="left", padx=10)
 
-        # CRF
         self.crf_frame = ttk.Frame(vid_frame)
         self.crf_frame.pack(fill="x", **pad)
         ttk.Label(self.crf_frame, text="CRF 14 best  →  35 smallest").pack(side="left")
@@ -217,7 +193,6 @@ class App:
         self.crf.trace_add("write", lambda *_: (self.crf_val_label.config(text=str(self.crf.get())),
                                                 self._update_suggestions()))
 
-        # Bitrate
         self.br_frame = ttk.Frame(vid_frame)
         self.br_frame.pack(fill="x", **pad)
         ttk.Label(self.br_frame, text="Target video bitrate").pack(side="left")
@@ -228,11 +203,9 @@ class App:
         self.br_val_label.pack(side="left", padx=6)
         self.bitrate_kbps.trace_add("write", lambda *_: self._update_suggestions())
 
-        self.twopass_chk = ttk.Checkbutton(vid_frame, text="Two pass for tighter size (CPU only)",
-                                           variable=self.twopass)
+        self.twopass_chk = ttk.Checkbutton(vid_frame, text="Two pass for tighter size (CPU only)", variable=self.twopass)
         self.twopass_chk.pack(anchor="w", padx=12)
 
-        # Codec + preset
         row = ttk.Frame(vid_frame)
         row.pack(fill="x", **pad)
         ttk.Label(row, text="Codec").pack(side="left")
@@ -241,12 +214,9 @@ class App:
                                    width=28, state="readonly")
         codec_combo.pack(side="left", padx=8)
         codec_combo.bind("<<ComboboxSelected>>", lambda e: self._update_mode_visibility())
-
         ttk.Label(row, text="Encoder preset").pack(side="left", padx=16)
-        ttk.Combobox(row, textvariable=self.vpreset, values=PRESETS, width=10,
-                     state="readonly").pack(side="left", padx=8)
+        ttk.Combobox(row, textvariable=self.vpreset, values=PRESETS, width=10, state="readonly").pack(side="left", padx=8)
 
-        # Resolution
         res_frame = ttk.Frame(vid_frame)
         res_frame.pack(fill="x", **pad)
         ttk.Label(res_frame, text="Resolution").pack(side="left")
@@ -258,13 +228,11 @@ class App:
         self.cw_entry.pack(side="left")
         ttk.Label(res_frame, text="Height keeps aspect").pack(side="left", padx=8)
 
-        # Suggestions
         sug_frame = ttk.LabelFrame(self.root, text="Suggestions")
         sug_frame.pack(fill="x", **pad)
         self.suggestion_lbl = ttk.Label(sug_frame, text="", justify="left")
         self.suggestion_lbl.pack(fill="x", padx=6, pady=4)
 
-        # Controls
         run_frame = ttk.Frame(self.root)
         run_frame.pack(fill="x", **pad)
         self.start_btn = ttk.Button(run_frame, text="Start", command=self.start)
@@ -276,17 +244,14 @@ class App:
         self.stop_btn = ttk.Button(run_frame, text="Quit", command=self.root.destroy)
         self.stop_btn.pack(side="left", padx=8)
 
-        # Progress group
         prog = ttk.LabelFrame(self.root, text="Progress")
         prog.pack(fill="x", **pad)
-
         ttk.Label(prog, text="Total").grid(row=0, column=0, sticky="w", padx=6, pady=4)
         self.total_bar = ttk.Progressbar(prog, variable=self.total_progress_var, maximum=100.0)
         self.total_bar.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
         prog.columnconfigure(1, weight=1)
         ttk.Label(prog, textvariable=self.total_percent_lbl_var, width=10, anchor="e").grid(row=0, column=2, padx=6)
         ttk.Label(prog, textvariable=self.total_count_lbl_var, width=12, anchor="e").grid(row=0, column=3, padx=6)
-
         ttk.Label(prog, text="Current").grid(row=1, column=0, sticky="w", padx=6, pady=4)
         self.cur_bar = ttk.Progressbar(prog, variable=self.current_progress_var, maximum=100.0)
         self.cur_bar.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
@@ -305,19 +270,16 @@ class App:
         ttk.Label(status, text="  ").pack(side="left")
         ttk.Label(status, textvariable=self.speed_lbl_var).pack(side="left", padx=6)
 
-        # Compare & Prune controls
         prune_frame = ttk.LabelFrame(self.root, text="Compare & Prune")
         prune_frame.pack(fill="x", **pad)
         ttk.Button(prune_frame, text="Compare & Prune Now", command=self.compare_and_prune_now).pack(side="left", padx=6)
         ttk.Label(prune_frame, textvariable=self.prune_summary_var).pack(side="left", padx=12)
 
-        # Failed list
         fail_frame = ttk.LabelFrame(self.root, text="Videos not compressed")
         fail_frame.pack(fill="both", **pad)
         self.fail_list = tk.Listbox(fail_frame, height=4)
         self.fail_list.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # Log
         log_frame = ttk.LabelFrame(self.root, text="Log")
         log_frame.pack(fill="both", expand=True, **pad)
         self.log = tk.Text(log_frame, height=12)
@@ -400,12 +362,10 @@ class App:
         else:
             self.br_frame.pack_configure()
             self.crf_frame.forget()
-
         if self._is_gpu_encoder(self.codec.get()):
             self.twopass_chk.state(["disabled"])
         else:
             self.twopass_chk.state(["!disabled"])
-
         self._update_suggestions()
 
     def _estimate_reco_bitrate(self):
@@ -420,40 +380,27 @@ class App:
                 else:
                     width = v[0]
                 break
-
         if width is None:
             return "Depends on source resolution"
-        if width >= 3840:
-            return "8000 to 20000 kbps usually ok"
-        if width >= 2560:
-            return "6000 to 12000 kbps usually ok"
-        if width >= 1920:
-            return "4000 to 8000 kbps usually ok"
-        if width >= 1280:
-            return "2000 to 4000 kbps usually ok"
-        if width >= 854:
-            return "1000 to 2000 kbps usually ok"
-        if width >= 640:
-            return "800 to 1500 kbps usually ok"
-        if width >= 426:
-            return "500 to 900 kbps usually ok"
+        if width >= 3840: return "8000 to 20000 kbps usually ok"
+        if width >= 2560: return "6000 to 12000 kbps usually ok"
+        if width >= 1920: return "4000 to 8000 kbps usually ok"
+        if width >= 1280: return "2000 to 4000 kbps usually ok"
+        if width >= 854:  return "1000 to 2000 kbps usually ok"
+        if width >= 640:  return "800 to 1500 kbps usually ok"
+        if width >= 426:  return "500 to 900 kbps usually ok"
         return "300 to 700 kbps usually ok"
 
     def _update_suggestions(self):
         if self.mode.get() == "crf":
             c = self.crf.get()
             self.crf_val_label.config(text=str(c))
-            if c <= 18:
-                msg = "Near lossless. Big file."
-            elif c <= 22:
-                msg = "High quality. Good size cut."
-            elif c <= 26:
-                msg = "Good default. Minor loss on a phone."
-            elif c <= 30:
-                msg = "Noticeable softness. Small file."
-            else:
-                msg = "Strong artifacts. Very small file."
-            txt = f"CRF {c}. {msg}\nUse H.264 for best compatibility. H.265 is smaller at the same quality."
+            if c <= 18:   msg = "Near lossless. Big file."
+            elif c <= 22: msg = "High quality. Good size cut."
+            elif c <= 26: msg = "Good default. Minor loss on a phone."
+            elif c <= 30: msg = "Noticeable softness. Small file."
+            else:         msg = "Strong artifacts. Very small file."
+            txt = f"CRF {c}. {msg}\nUse H.264 for best compatibility. H.265 is smaller at same quality."
         else:
             kbps = self.bitrate_kbps.get()
             self.br_val_label.config(text=f"{kbps} kbps")
@@ -467,7 +414,7 @@ class App:
             if self.twopass.get() and not self._is_gpu_encoder(self.codec.get()):
                 txt += "\nTwo pass gives tighter sizes for bitrate mode."
         if self._is_gpu_encoder(self.codec.get()):
-            txt += "\nNote: Two-pass is CPU-only; hardware encoders use single-pass VBR or CQ."
+            txt += "\nNote: Two-pass is CPU-only; hardware encoders use single-pass VBR/CQ."
         self.suggestion_lbl.config(text=txt)
 
     # ---------- Run / Pause / Resume ----------
@@ -552,7 +499,7 @@ class App:
     def _run_all(self, snapshot_mode, snapshot_twopass, snapshot_codec):
         try:
             total_files = len(self.input_files)
-            for idx, src in enumerate(list(self.input_files), start=1):
+            for src in list(self.input_files):
                 while not self.pause_flag.is_set():
                     time.sleep(0.2)
 
@@ -566,26 +513,26 @@ class App:
                         two_pass=(snapshot_mode == "bitrate" and snapshot_twopass),
                         snapshot_codec=snapshot_codec
                     )
+                    # validate output right after convert
+                    self._post_encode_validate(src)
                     self.completed_count += 1
                 except Exception as e:
                     self.failed_files.append(src)
                     self.fail_list.insert(tk.END, src)
                     self.log_write(f"[ERROR] {os.path.basename(src)} failed. {e}\n")
-                    # mark remaining planned work for this file as done to keep ETA advancing
+                    # Advance ETA accounting for rest of planned work for this file
                     planned = self.plan.get(src, {}).get("duration", 0.0) * self.plan.get(src, {}).get("passes", 1)
                     self.work_done_units += max(0.0, planned - self.cur_file_pass_progress_sec)
 
                 self.total_count_lbl_var.set(f"{self.completed_count} / {total_files}")
 
-            # Auto compare and prune after batch
+            # Auto compare & prune after batch
             self._compare_and_prune()
 
             self.log_write("All done.\n")
             if self.failed_files:
-                messagebox.showwarning(
-                    "Done with errors",
-                    f"Finished with {len(self.failed_files)} failure(s). See list and log."
-                )
+                messagebox.showwarning("Done with errors",
+                    f"Finished with {len(self.failed_files)} failure(s). See list and log.")
             else:
                 messagebox.showinfo("Done", "All conversions finished.")
         finally:
@@ -606,11 +553,7 @@ class App:
         if vcodec in ("libx264", "libx265"):
             return ["-preset", preset]
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
-            map_nv = {
-                "ultrafast": "p1", "superfast": "p2", "veryfast": "p3",
-                "faster": "p3", "fast": "p4", "medium": "p4",
-                "slow": "p5", "slower": "p6", "veryslow": "p7",
-            }
+            map_nv = {"ultrafast":"p1","superfast":"p2","veryfast":"p3","faster":"p3","fast":"p4","medium":"p4","slow":"p5","slower":"p6","veryslow":"p7"}
             return ["-preset", map_nv.get(preset, "p4"), "-tune", "hq"]
         if vcodec in ("h264_qsv", "hevc_qsv"):
             return ["-preset", preset]
@@ -632,16 +575,15 @@ class App:
         scale_filter = self._build_scale_filter()
         vf_args = ["-vf", scale_filter] if scale_filter else []
 
+        # HW accel flags (optional)
         hw_flags = []
         if vcodec in ("h264_nvenc", "hevc_nvenc"):
             hw_flags = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif vcodec in ("h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"):
-            hw_flags = ["-hwaccel", "d3d11va"]
+            hw_flags = ["-hwaccel", "d3d11va"]  # safe default on Windows; ignored elsewhere
 
         common = [
-            self.ffmpeg_path, "-y",
-            "-hide_banner",
-            "-progress", "pipe:1",
+            self.ffmpeg_path, "-y", "-hide_banner", "-progress", "pipe:1",
         ] + hw_flags + [
             "-i", src_path,
             "-map", "0:v:0?",
@@ -654,28 +596,17 @@ class App:
 
         if self.mode.get() == "crf":
             c = int(self.crf.get())
-            v_args = []
             if vcodec in ("h264_nvenc", "hevc_nvenc"):
-                cq = max(14, min(35, c))
-                v_args = ["-rc", "vbr", "-cq", str(cq), "-tune", "hq"]
+                v_args = ["-rc", "vbr", "-cq", str(max(14, min(35, c))), "-tune", "hq"]
             elif vcodec in ("h264_qsv", "hevc_qsv"):
-                gq = max(16, min(35, c))
-                v_args = ["-global_quality", str(gq)]
+                v_args = ["-global_quality", str(max(16, min(35, c)))]
             elif vcodec in ("h264_amf", "hevc_amf"):
                 qp = max(18, min(35, c))
-                v_args = ["-rc", "vbr_latency", "-quality", "quality",
-                          "-qp_i", str(qp - 1), "-qp_p", str(qp), "-qp_b", str(qp + 2)]
+                v_args = ["-rc", "vbr_latency", "-quality", "quality", "-qp_i", str(qp-1), "-qp_p", str(qp), "-qp_b", str(qp+2)]
             else:
                 v_args = ["-crf", str(c)]
-
-            args = common + v_args + [
-                "-c:a", "aac",
-                "-b:a", ab,
-                "-movflags", "+faststart",
-                dst_path
-            ]
-            self.cur_pass_index = 1
-            self.cur_pass_count = 1
+            args = common + v_args + ["-c:a", "aac", "-b:a", ab, "-movflags", "+faststart", dst_path]
+            self.cur_pass_index, self.cur_pass_count = 1, 1
             self.current_pass_lbl_var.set("Pass: 1 / 1")
             self._run_ffmpeg_with_progress(args, duration, pass_index=1, pass_count=1)
         else:
@@ -683,37 +614,16 @@ class App:
             if two_pass and vcodec in ("libx264", "libx265"):
                 with tempfile.TemporaryDirectory() as td:
                     logf = os.path.join(td, "ffpass.log")
-                    # First pass
-                    args1 = common + [
-                        "-b:v", kbps,
-                        "-pass", "1",
-                        "-passlogfile", logf,
-                        "-an",
-                        "-f", "mp4",
-                        platform_null_sink()
-                    ]
-                    self.cur_pass_index = 1
-                    self.cur_pass_count = 2
+                    args1 = common + ["-b:v", kbps, "-pass", "1", "-passlogfile", logf, "-an", "-f", "mp4", platform_null_sink()]
+                    self.cur_pass_index, self.cur_pass_count = 1, 2
                     self.current_pass_lbl_var.set("Pass: 1 / 2")
                     self._run_ffmpeg_with_progress(args1, duration, pass_index=1, pass_count=2)
-
-                    # Second pass
-                    args2 = common + [
-                        "-b:v", kbps,
-                        "-pass", "2",
-                        "-passlogfile", logf,
-                        "-c:a", "aac",
-                        "-b:a", ab,
-                        "-movflags", "+faststart",
-                        dst_path
-                    ]
-                    self.cur_pass_index = 2
-                    self.cur_pass_count = 2
+                    args2 = common + ["-b:v", kbps, "-pass", "2", "-passlogfile", logf, "-c:a", "aac", "-b:a", ab, "-movflags", "+faststart", dst_path]
+                    self.cur_pass_index, self.cur_pass_count = 2, 2
                     self.current_pass_lbl_var.set("Pass: 2 / 2")
                     self.cur_file_pass_progress_sec = 0.0
                     self._run_ffmpeg_with_progress(args2, duration, pass_index=2, pass_count=2)
             else:
-                v_args = []
                 if vcodec in ("h264_nvenc", "hevc_nvenc"):
                     v_args = ["-rc", "vbr", "-b:v", kbps, "-tune", "hq"]
                 elif vcodec in ("h264_qsv", "hevc_qsv"):
@@ -722,23 +632,24 @@ class App:
                     v_args = ["-rc", "vbr_latency", "-b:v", kbps, "-quality", "quality"]
                 else:
                     v_args = ["-b:v", kbps]
-
-                args = common + v_args + [
-                    "-c:a", "aac",
-                    "-b:a", ab,
-                    "-movflags", "+faststart",
-                    dst_path
-                ]
-                self.cur_pass_index = 1
-                self.cur_pass_count = 1
+                args = common + v_args + ["-c:a", "aac", "-b:a", ab, "-movflags", "+faststart", dst_path]
+                self.cur_pass_index, self.cur_pass_count = 1, 1
                 self.current_pass_lbl_var.set("Pass: 1 / 1")
                 self._run_ffmpeg_with_progress(args, duration, pass_index=1, pass_count=1)
 
-        # Validate output immediately
-        if not self._is_media_ok(dst_path):
-            self.log_write(f"[WARN] Output looks corrupt: {os.path.basename(dst_path)}. Deleting it.\n")
-            self._safe_remove(dst_path)
-            # mark as failed so it appears in the list
+    def _post_encode_validate(self, src_path):
+        """Validate the just produced file; if corrupt, send it to recycle."""
+        base = os.path.splitext(os.path.basename(src_path))[0]
+        dst_path = os.path.join(os.path.dirname(src_path), "compressed videos", f"{base}.mp4")
+
+        # Small sleep to release file handles on Windows
+        time.sleep(0.2)
+
+        ok = self._is_media_ok(dst_path)
+        if not ok:
+            self.log_write(f"[WARN] Output looks corrupt or unreadable: {os.path.basename(dst_path)}. Sending to Recycle Bin.\n")
+            self._recycle(dst_path)
+            # Mark as failed so it's visible
             if src_path not in self.failed_files:
                 self.failed_files.append(src_path)
                 self.fail_list.insert(tk.END, src_path)
@@ -766,8 +677,14 @@ class App:
     # ---------- Subprocess driver with progress parsing ----------
     def _run_ffmpeg_with_progress(self, args, duration_sec, pass_index=1, pass_count=1):
         self.log_write(" ".join([self._quote(a) for a in args]) + "\n")
+        # Lower priority on Windows to play nicer with Defender ML heuristics
+        creationflags = 0
+        if os.name == "nt":
+            BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+            creationflags |= BELOW_NORMAL_PRIORITY_CLASS
+
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                universal_newlines=True, bufsize=1)
+                                universal_newlines=True, bufsize=1, creationflags=creationflags)
         self.current_proc = proc
         last_lines = []
         out_time_sec = 0.0
@@ -781,7 +698,6 @@ class App:
                 line = raw.strip()
                 if not line:
                     continue
-
                 last_lines.append(line)
                 if len(last_lines) > 120:
                     last_lines.pop(0)
@@ -798,10 +714,7 @@ class App:
                         pass
                     self.cur_file_pass_progress_sec = out_time_sec
 
-                    cur_pct = 0.0
-                    if duration_sec > 0:
-                        frac = min(1.0, out_time_sec / duration_sec)
-                        cur_pct = frac * 100.0
+                    cur_pct = (min(1.0, out_time_sec / duration_sec) * 100.0) if duration_sec > 0 else 0.0
                     self.current_progress_var.set(cur_pct)
                     self.current_percent_lbl_var.set(f"{cur_pct:.1f}%")
 
@@ -811,18 +724,12 @@ class App:
                     self.total_progress_var.set(total_pct)
                     self.total_percent_lbl_var.set(f"{total_pct:.1f}%")
 
-                    eta_cur = self._eta_seconds(
-                        remaining_sec=max(0.0, duration_sec - out_time_sec),
-                        speed_x=self.last_speed_x
-                    )
+                    eta_cur = self._eta_seconds(max(0.0, duration_sec - out_time_sec), self.last_speed_x)
                     self.current_eta_lbl_var.set(f"ETA current: {self._fmt_hms(eta_cur)}")
 
-                    # remaining units
+                    # Compute remaining work (this pass + future passes + other files)
                     remaining_current_pass = max(0.0, duration_sec - out_time_sec)
-                    remaining_passes_this_file = 0.0
-                    if pass_count == 2 and pass_index == 1:
-                        remaining_passes_this_file += duration_sec
-
+                    remaining_passes_this_file = duration_sec if (pass_count == 2 and pass_index == 1) else 0.0
                     remaining_other_files = 0.0
                     after = False
                     for f in self.input_files:
@@ -832,19 +739,16 @@ class App:
                         if after:
                             info = self.plan.get(f, {"duration": 0.0, "passes": 1})
                             remaining_other_files += info["duration"] * info["passes"]
-
                     total_remaining_units = remaining_current_pass + remaining_passes_this_file + remaining_other_files
-                    eta_total = self._eta_seconds(remaining_sec=total_remaining_units, speed_x=self.last_speed_x)
+                    eta_total = self._eta_seconds(total_remaining_units, self.last_speed_x)
                     self.total_eta_lbl_var.set(f"ETA total: {self._fmt_hms(eta_total)}")
                     self.speed_lbl_var.set(f"Speed: {self.last_speed_x:.2f}x")
                     self.root.update_idletasks()
 
                 elif key == "speed":
                     try:
-                        if val.endswith("x"):
-                            self.last_speed_x = max(0.01, float(val[:-1]))
-                        else:
-                            self.last_speed_x = max(0.01, float(val))
+                        self.last_speed_x = float(val[:-1] if val.endswith("x") else val)
+                        self.last_speed_x = max(0.01, self.last_speed_x)
                     except Exception:
                         pass
 
@@ -856,23 +760,30 @@ class App:
             tail = "\n".join(last_lines[-40:])
             raise RuntimeError(f"ffmpeg failed with code {proc.returncode}\n\nLast lines:\n{tail}")
 
-        # pass completed successfully, advance work units
         self.work_done_units += duration_sec
 
-    # ---------- Probing and validation ----------
-    def _probe_duration(self, path):
-        try:
-            out = subprocess.check_output(
-                [self.ffprobe_path, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "format=duration", "-of", "csv=p=0", path],
-                universal_newlines=True, stderr=subprocess.STDOUT
-            )
-            dur = float(out.strip())
-            if dur > 0:
-                return dur
-        except Exception:
-            pass
+    # ---------- Probing & validation ----------
+    def _has_ffprobe(self):
+        # True if ffprobe exists at path or on PATH
+        if self.ffprobe_path and os.path.isabs(self.ffprobe_path) and os.path.exists(self.ffprobe_path):
+            return True
+        return shutil.which(self.ffprobe_path) is not None
 
+    def _probe_duration(self, path):
+        # Prefer ffprobe; fallback to parsing ffmpeg output
+        if self._has_ffprobe():
+            try:
+                out = subprocess.check_output(
+                    [self.ffprobe_path, "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", path],
+                    universal_newlines=True, stderr=subprocess.STDOUT
+                )
+                dur = float(out.strip())
+                if dur > 0:
+                    return dur
+            except Exception:
+                pass
+        # Fallback: parse "Duration:" from ffmpeg -i
         try:
             out = subprocess.check_output(
                 [self.ffmpeg_path, "-hide_banner", "-i", path],
@@ -880,7 +791,6 @@ class App:
             )
         except subprocess.CalledProcessError as e:
             out = e.output or ""
-
         for line in out.splitlines():
             line = line.strip()
             if "Duration:" in line:
@@ -892,44 +802,53 @@ class App:
                         return dur
                 except Exception:
                     pass
-
         self.log_write(f"[WARN] Could not probe duration for {os.path.basename(path)}. Assuming 60s.\n")
         return 60.0
 
     def _is_media_ok(self, path):
-        # Quick sanity: file must exist and be > 0 bytes
+        """Return True if file looks valid. Never flags as corrupt just because ffprobe is missing."""
+        # Exists and non-empty?
         try:
             if not os.path.exists(path) or os.path.getsize(path) <= 0:
                 return False
         except Exception:
             return False
 
-        # Must have a video stream
+        # Try ffprobe quick checks if available
+        if self._has_ffprobe():
+            try:
+                # Has at least one video stream?
+                out = subprocess.check_output(
+                    [self.ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+                    universal_newlines=True, stderr=subprocess.STDOUT
+                ).strip()
+                if not out:
+                    return False
+                # Duration positive?
+                out = subprocess.check_output(
+                    [self.ffprobe_path, "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", path],
+                    universal_newlines=True, stderr=subprocess.STDOUT
+                ).strip()
+                dur = float(out)
+                if dur <= 0:
+                    return False
+                return True
+            except Exception:
+                # Fall through to ffmpeg decode test
+                pass
+
+        # Fallback: try decoding first frame with ffmpeg (slower but robust)
         try:
-            out = subprocess.check_output(
-                [self.ffprobe_path, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
-                universal_newlines=True, stderr=subprocess.STDOUT
-            ).strip()
-            if not out:
-                return False
+            # Decode 1 video frame to null; if decoding fails, return code != 0
+            cmd = [self.ffmpeg_path, "-v", "error", "-hide_banner",
+                   "-ss", "0", "-i", path, "-map", "0:v:0", "-frames:v", "1",
+                   "-f", "null", platform_null_sink()]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            return proc.returncode == 0
         except Exception:
             return False
-
-        # Duration must parse and be positive
-        try:
-            out = subprocess.check_output(
-                [self.ffprobe_path, "-v", "error", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", path],
-                universal_newlines=True, stderr=subprocess.STDOUT
-            ).strip()
-            dur = float(out)
-            if not (dur > 0):
-                return False
-        except Exception:
-            return False
-
-        return True
 
     # ---------- Compare & Prune ----------
     def compare_and_prune_now(self):
@@ -939,14 +858,12 @@ class App:
         self._compare_and_prune()
 
     def _compare_and_prune(self):
-        # Scan pairs from the input list. For each original file, look for an mp4 inside its 'compressed videos' subfolder.
         deleted_originals = 0
         deleted_compressed = 0
         corrupt_compressed = 0
         kept_originals = 0
         kept_compressed = 0
         missing_compressed = 0
-
         seen_fail_added = set()
 
         for original in self.input_files:
@@ -957,23 +874,21 @@ class App:
 
             if not os.path.exists(comp_path):
                 missing_compressed += 1
-                # mark not compressed
                 if original not in self.failed_files and original not in seen_fail_added:
                     self.failed_files.append(original)
                     self.fail_list.insert(tk.END, original)
                     seen_fail_added.add(original)
                 continue
 
-            # If compressed exists, validate it
+            # Validate compressed. If clearly corrupt, recycle compressed and keep original.
             if not self._is_media_ok(comp_path):
-                self.log_write(f"[PRUNE] Compressed file corrupt. Deleting: {comp_path}\n")
-                self._safe_remove(comp_path)
+                self.log_write(f"[PRUNE] Compressed file unreadable/corrupt. Recycle: {comp_path}\n")
+                self._recycle(comp_path)
                 corrupt_compressed += 1
                 kept_originals += 1
                 continue
 
-            # Optional: you can also validate original, but requirement focuses on compressed corruption.
-            # Compare sizes and keep the smaller one
+            # Size compare (keep smaller). Equal size -> keep original.
             try:
                 orig_sz = os.path.getsize(original)
                 comp_sz = os.path.getsize(comp_path)
@@ -982,46 +897,75 @@ class App:
                 continue
 
             if comp_sz < orig_sz:
-                # keep compressed, delete original
-                try:
-                    self._safe_remove(original)
+                # keep compressed, recycle original
+                if self._recycle(original):
                     deleted_originals += 1
                     kept_compressed += 1
-                    self.log_write(f"[PRUNE] Kept compressed ({self._fmt_bytes(comp_sz)}). Deleted original ({self._fmt_bytes(orig_sz)}): {original}\n")
-                except Exception as e:
-                    self.log_write(f"[PRUNE] Could not delete original {original}: {e}\n")
+                    self.log_write(f"[PRUNE] Kept compressed ({self._fmt_bytes(comp_sz)}). Recycled original ({self._fmt_bytes(orig_sz)}): {original}\n")
+                else:
+                    self.log_write(f"[PRUNE] Could not recycle original {original}\n")
             else:
-                # keep original, delete compressed (also if equal size)
-                try:
-                    self._safe_remove(comp_path)
+                # keep original, recycle compressed (also if equal)
+                if self._recycle(comp_path):
                     deleted_compressed += 1
                     kept_originals += 1
-                    self.log_write(f"[PRUNE] Kept original ({self._fmt_bytes(orig_sz)}). Deleted compressed ({self._fmt_bytes(comp_sz)}): {comp_path}\n")
-                except Exception as e:
-                    self.log_write(f"[PRUNE] Could not delete compressed {comp_path}: {e}\n")
+                    self.log_write(f"[PRUNE] Kept original ({self._fmt_bytes(orig_sz)}). Recycled compressed ({self._fmt_bytes(comp_sz)}): {comp_path}\n")
+                else:
+                    self.log_write(f"[PRUNE] Could not recycle compressed {comp_path}\n")
 
-        summary = (
-            f"Compare & Prune -> "
-            f"kept_orig={kept_originals}, kept_comp={kept_compressed}, "
-            f"del_orig={deleted_originals}, del_comp={deleted_compressed}, "
-            f"corrupt_comp_deleted={corrupt_compressed}, missing_comp={missing_compressed}"
-        )
+        summary = (f"Compare & Prune -> "
+                   f"kept_orig={kept_originals}, kept_comp={kept_compressed}, "
+                   f"del_orig={deleted_originals}, del_comp={deleted_compressed}, "
+                   f"corrupt_comp_deleted={corrupt_compressed}, missing_comp={missing_compressed}")
         self.prune_summary_var.set(summary)
         self.log_write(summary + "\n")
 
     # ---------- Utils ----------
-    def _safe_remove(self, path):
+    def _recycle(self, path):
+        """Send file to Recycle Bin (Windows) or Trash if possible; fallback to delete."""
         try:
+            if not os.path.exists(path):
+                return True
+            # Preferred: send2trash (cross-platform)
+            if send2trash is not None:
+                send2trash(path)
+                return True
+
+            # Windows no-deps fallback using SHFileOperationW
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes as wt
+                FO_DELETE = 3
+                FOF_ALLOWUNDO = 0x0040
+                FOF_NOCONFIRMATION = 0x0010
+                FOF_SILENT = 0x0004
+
+                class SHFILEOPSTRUCTW(ctypes.Structure):
+                    _fields_ = [
+                        ('hwnd', wt.HWND),
+                        ('wFunc', wt.UINT),
+                        ('pFrom', wt.LPCWSTR),
+                        ('pTo', wt.LPCWSTR),
+                        ('fFlags', wt.USHORT),
+                        ('fAnyOperationsAborted', wt.BOOL),
+                        ('hNameMappings', wt.LPVOID),
+                        ('lpszProgressTitle', wt.LPCWSTR),
+                    ]
+
+                sh = SHFILEOPSTRUCTW()
+                sh.wFunc = FO_DELETE
+                # double-null-terminated list
+                sh.pFrom = path + '\0\0'
+                sh.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+                res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(sh))
+                return res == 0 and not sh.fAnyOperationsAborted
+
+            # Last resort (non-Windows): direct delete
             os.remove(path)
-        except PermissionError:
-            # Try to make writable then delete
-            try:
-                os.chmod(path, 0o666)
-                os.remove(path)
-            except Exception as e:
-                self.log_write(f"[DEL] Permission error removing {path}: {e}\n")
+            return True
         except Exception as e:
-            self.log_write(f"[DEL] Error removing {path}: {e}\n")
+            self.log_write(f"[RECYCLE] Error sending to Recycle Bin: {path} -> {e}\n")
+            return False
 
     def _fmt_bytes(self, n):
         try:
@@ -1065,7 +1009,6 @@ class App:
             return f"\"{s}\""
         return str(s)
 
-
 def main():
     root = tk.Tk()
     style = ttk.Style()
@@ -1078,7 +1021,6 @@ def main():
         pass
     App(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
